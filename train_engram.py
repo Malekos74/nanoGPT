@@ -97,6 +97,7 @@ max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
+muon_momentum = 0.95 # Muon (backbone matrices); AdamW takes the rest, see model_engram.configure_optimizers
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
@@ -342,9 +343,10 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizers = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, muon_momentum)
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    for name, opt in optimizers.items():
+        opt.load_state_dict(checkpoint['optimizers'][name])
 checkpoint = None # free up memory
 
 # compile the model
@@ -404,8 +406,9 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    for opt in optimizers.values():
+        for param_group in opt.param_groups:
+            param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -424,7 +427,7 @@ while True:
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
+                    'optimizers': {name: opt.state_dict() for name, opt in optimizers.items()},
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -457,13 +460,24 @@ while True:
     with record_function("optimizer"):
         # clip the gradient
         if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
+            for opt in optimizers.values():
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
+        # step the optimizers and the scaler if training in fp16
+        for name, opt in optimizers.items():
+            with record_function(f"optimizer/{name}"):
+                scaler.step(opt)
         scaler.update()
         # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers.values():
+            opt.zero_grad(set_to_none=True)
+    if profile and master_process and device_type == 'cuda':
+        # drain the GPU at the step boundary while profiling: otherwise the window
+        # opens with up to a launch queue's worth of the previous step's kernels
+        # still running (unattributable) and closes with as many of this step's
+        # still queued (lost). The wait is its own row: GPU time minus host time.
+        with record_function("step/sync"):
+            torch.cuda.synchronize()
     step_span.__exit__(None, None, None)
     if profile and master_process:
         profiler.step()

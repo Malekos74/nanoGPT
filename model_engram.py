@@ -28,6 +28,44 @@ from engram import EngramMemoryConfig, build_engram_layers
 from model import GPT, GPTConfig
 
 
+# Backward-pass profiler ranges. torch.profiler does not carry forward labels
+# into backward, so a pair of identity autograd Functions brackets a region:
+# ``_EnterRange`` is applied to the region's *output* (its backward runs first
+# and opens the range), ``_ExitRange`` to the region's *input* (its backward
+# runs last and closes it). Autograd runs the most recently created nodes
+# first, so a side branch such as an Engram layer is processed contiguously
+# between the two markers.
+_OPEN_RANGES: dict[str, record_function] = {}
+
+
+class _EnterRange(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, name):
+        ctx.name = name
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        if ctx.name in _OPEN_RANGES:
+            raise RuntimeError(f"backward range {ctx.name!r} opened twice")
+        span = record_function(ctx.name)
+        span.__enter__()
+        _OPEN_RANGES[ctx.name] = span
+        return grad, None
+
+
+class _ExitRange(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, name):
+        ctx.name = name
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        _OPEN_RANGES.pop(ctx.name).__exit__(None, None, None)
+        return grad, None
+
+
 @dataclass
 class GPTEngramConfig(GPTConfig):
     """``GPTConfig`` plus the Engram memory section.
@@ -100,7 +138,7 @@ class GPTWithEngram(GPT):
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        with record_function("fwd/embed"):
+        with record_function("fwd/backbone"):
             tok_emb = self.transformer.wte(idx)
             pos_emb = self.transformer.wpe(pos)
             x = self.transformer.drop(tok_emb + pos_emb)
@@ -110,16 +148,18 @@ class GPTWithEngram(GPT):
                 # upstream injects the memory before the block, on the
                 # residual stream (hidden = engram(hidden, ids) + hidden)
                 with record_function("fwd/engram"):
-                    x = x + memory(hidden_states=x, input_ids=idx)
-            with record_function("fwd/block"):
-                x = block(x)
-        with record_function("fwd/head"):
-            x = self.transformer.ln_f(x)
+                    out = memory(hidden_states=_ExitRange.apply(x, "bwd/engram"), input_ids=idx)
+                    x = x + _EnterRange.apply(out, "bwd/engram")
+            with record_function("fwd/backbone"):
+                x = _EnterRange.apply(block(_ExitRange.apply(x, "bwd/backbone")), "bwd/backbone")
+        with record_function("fwd/backbone"):
+            x = self.transformer.ln_f(_ExitRange.apply(x, "bwd/backbone"))
             if targets is not None:
                 logits = self.lm_head(x)
                 loss = torch.nn.functional.cross_entropy(
                     logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
                 )
+                loss = _EnterRange.apply(loss, "bwd/backbone")
             else:
                 logits = self.lm_head(x[:, [-1], :])
                 loss = None
@@ -146,59 +186,44 @@ class GPTWithEngram(GPT):
         flops_promised = 312e12  # A100 bfloat16 peak, as in GPT.estimate_mfu
         return flops_per_iter * (1.0 / dt) / flops_promised
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """GPT's two groups, plus a third for the memory tables.
-
-        The Engram tables are 2-D, so GPT's own split would put them
-        in the decay group. The access trace says one training step
-        touches most rows of an Engram-27B-sized table, so sparse
-        updates buy little and a plain (decayed or not) full step is
-        the honest baseline -- but the tables are far too big to
-        decay like matmul weights, so they get their own group with
-        ``weight_decay`` off. Override the tables' lr by replacing the
-        group after this call.
-        """
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # the Engram tables are 2-D, so GPT's own split would put them
-        # in the decay group; carve them out by name into their own group
-        engram_names = {
-            n for n in param_dict if n.startswith("engram_layers.")
-            and ".multi_head_embedding." in n
-        }
-        decay_params = [
-            p for n, p in param_dict.items()
-            if p.dim() >= 2 and n not in engram_names
-        ]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        engram_tables = [param_dict[n] for n in sorted(engram_names)]
-
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-            {"params": engram_tables, "weight_decay": 0.0},
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        num_engram_params = sum(p.numel() for p in engram_tables)
-        print(
-            f"num decayed parameter tensors: {len(decay_params)}, "
-            f"with {num_decay_params:,} parameters"
-        )
-        print(
-            f"num non-decayed parameter tensors: {len(nodecay_params)}, "
-            f"with {num_nodecay_params:,} parameters"
-        )
-        print(
-            f"num engram table tensors: {len(engram_tables)}, "
-            f"with {num_engram_params:,} parameters"
-        )
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, muon_momentum):
+        """Three optimizers, mirroring the paper's setup: Muon for the backbone's
+        2-D weight matrices (attention, MLP and the Engram projections), AdamW
+        for everything Muon cannot take (token and position embeddings, norms,
+        biases, the short conv), and a separate AdamW for the memory tables so
+        their update is its own profiler range and gets no weight decay. The
+        training loop steps all three; ``lr`` is set on every group of each."""
+        params = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        tables = {n for n in params if n.startswith("engram_layers.") and ".multi_head_embedding." in n}
+        embeddings = {"transformer.wte.weight", "transformer.wpe.weight"}
+        muon_params = [p for n, p in params.items() if p.dim() == 2 and n not in tables | embeddings]
+        rest = {n: p for n, p in params.items() if n not in tables and not (p.dim() == 2 and n not in embeddings)}
+        decay_params = [p for p in rest.values() if p.dim() >= 2]
+        nodecay_params = [p for p in rest.values() if p.dim() < 2]
+        table_params = [params[n] for n in sorted(tables)]
+        for label, group in [("muon (2-D backbone)", muon_params), ("adamw decayed", decay_params),
+                             ("adamw non-decayed", nodecay_params), ("engram tables", table_params)]:
+            print(f"num {label} tensors: {len(group)}, with {sum(p.numel() for p in group):,} parameters")
 
         import inspect
 
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizers = {
+            "muon": torch.optim.Muon(
+                muon_params, lr=learning_rate, weight_decay=weight_decay,
+                momentum=muon_momentum, nesterov=True, adjust_lr_fn="match_rms_adamw",
+            ),
+            "adamw": torch.optim.AdamW(
+                [{"params": decay_params, "weight_decay": weight_decay},
+                 {"params": nodecay_params, "weight_decay": 0.0}],
+                lr=learning_rate, betas=betas, **extra_args,
+            ),
+        }
+        if table_params:  # a plain GPT (engram=None) has no tables to step
+            optimizers["tables"] = torch.optim.AdamW(
+                table_params, lr=learning_rate, betas=betas, weight_decay=0.0, **extra_args,
+            )
         print(f"using fused AdamW: {use_fused}")
-        return optimizer
+        return optimizers
