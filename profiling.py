@@ -46,8 +46,7 @@ COMPONENTS = [
     "bwd/backbone",
     "bwd/engram",
     "optimizer",
-    "optimizer/muon",
-    "optimizer/adamw",
+    "optimizer/backbone",
     "optimizer/tables",
 ]
 DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")

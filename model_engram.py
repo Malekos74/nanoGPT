@@ -130,6 +130,32 @@ class GPTWithEngram(GPT):
             return None
         return self.engram_layers._modules.get(str(layer_id))
 
+    # Regions are methods so that ``compile_regions`` can compile each one on
+    # its own; the labels and backward markers in ``forward`` stay eager.
+    def _embed(self, idx, pos):
+        return self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+
+    def _head(self, x, targets):
+        logits = self.lm_head(self.transformer.ln_f(x))
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+        )
+        return logits, loss
+
+    def compile_regions(self, mode: str) -> None:
+        """torch.compile the embedding, every block, the head and each Engram
+        sub-step as separate graphs. Whole-model ``torch.compile`` would drop
+        the record_function labels and the backward markers between them;
+        per-region compilation keeps the per-component profile and loses only
+        fusion across region boundaries."""
+        self._embed = torch.compile(self._embed, mode=mode)
+        for block in self.transformer.h:
+            block.forward = torch.compile(block.forward, mode=mode)
+        self._head = torch.compile(self._head, mode=mode)
+        if self.engram_layers is not None:
+            for module in self.engram_layers.values():
+                module.compile_regions(mode=mode)
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -139,9 +165,7 @@ class GPTWithEngram(GPT):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         with record_function("fwd/backbone"):
-            tok_emb = self.transformer.wte(idx)
-            pos_emb = self.transformer.wpe(pos)
-            x = self.transformer.drop(tok_emb + pos_emb)
+            x = self._embed(idx, pos)
         for layer_id, block in enumerate(self.transformer.h):
             memory = self._engram_at(layer_id)
             if memory is not None:
@@ -153,15 +177,12 @@ class GPTWithEngram(GPT):
             with record_function("fwd/backbone"):
                 x = _EnterRange.apply(block(_ExitRange.apply(x, "bwd/backbone")), "bwd/backbone")
         with record_function("fwd/backbone"):
-            x = self.transformer.ln_f(_ExitRange.apply(x, "bwd/backbone"))
+            x = _ExitRange.apply(x, "bwd/backbone")
             if targets is not None:
-                logits = self.lm_head(x)
-                loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-                )
+                logits, loss = self._head(x, targets)
                 loss = _EnterRange.apply(loss, "bwd/backbone")
             else:
-                logits = self.lm_head(x[:, [-1], :])
+                logits = self.lm_head(self.transformer.ln_f(x[:, [-1], :]))
                 loss = None
 
         return logits, loss

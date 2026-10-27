@@ -12,10 +12,12 @@ Same shape as ``train.py`` (single GPU debug mode, or DDP via
 To run on a single GPU, example:
 $ python train_engram.py --batch_size=32 --compile=False
 
-``compile`` defaults to False here: torch.compile needs triton,
-which has no Windows wheels, and dynamo tracing through the
-Engram modules is its own debugging burden. Flip it back on
-on a Linux box once the wiring is trusted.
+``compile`` compiles the model per region (the embedding, each
+block, the head and each Engram sub-step) through
+``model_engram.compile_regions``, so the profiler labels and the
+backward markers between the regions stay in eager Python and the
+per-component table survives; whole-model torch.compile would
+drop them.
 
 Note on data: Engram's addressing is defined on DeepSeek-V3
 token ids, compressed through the upstream CompressedTokenizer.
@@ -109,7 +111,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False # torch.compile needs triton (no Windows wheels); see module docstring
+compile = False # per-region torch.compile, see module docstring
+compile_mode = 'default' # torch.compile mode for the regions: 'default', 'reduce-overhead' (CUDA graphs), 'max-autotune'
 # profiling: per-component time of a gradient step -> out_dir/profile.md (see profiling.py)
 profile = False
 profile_warmup = 5 # steps skipped before the profiler starts recording
@@ -351,9 +354,8 @@ checkpoint = None # free up memory
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    print(f"compiling the model's regions (mode={compile_mode})... (takes a ~minute)")
+    model.compile_regions(mode=compile_mode)
 
 # wrap model into DDP container
 if ddp:
@@ -465,7 +467,8 @@ while True:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         # step the optimizers and the scaler if training in fp16
         for name, opt in optimizers.items():
-            with record_function(f"optimizer/{name}"):
+            # muon and adamw together are the backbone's update; the tables are their own row
+            with record_function("optimizer/tables" if name == "tables" else "optimizer/backbone"):
                 scaler.step(opt)
         scaler.update()
         # flush the gradients as soon as we can, no need for this memory anymore

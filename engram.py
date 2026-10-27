@@ -144,30 +144,50 @@ class EngramMemory(nn.Module):
             dilation=config.max_ngram_size,
         )
 
+    # The sub-steps are methods so that ``compile_regions`` can compile each
+    # one on its own; the profiler labels in ``forward`` stay in eager Python
+    # (torch.compile drops record_function ranges inside a compiled graph).
+    def _compress(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.lookup_table[input_ids.to(self.lookup_table.device)]
+
+    def _fetch(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        return self.multi_head_embedding(hash_ids + self.table_offsets).flatten(start_dim=-2)
+
+    def _gate(self, embeddings: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        # one gate over the whole stream, replacing upstream's per-slice
+        # (hc_mult) gates: |cos| between the memory key and the residual
+        # stream, mapped to a multiplicative factor ~ sqrt(|cos|)
+        key = self.norm1(self.key_proj(embeddings))
+        query = self.norm2(hidden_states)
+        gate = (key * query).sum(dim=-1) / math.sqrt(hidden_states.size(-1))
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        return gate.sigmoid().unsqueeze(-1)
+
+    def _value(self, embeddings: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        return gate * self.value_proj(embeddings)
+
+    def compile_regions(self, mode: str) -> None:
+        """torch.compile each sub-step separately, keeping the labels between them."""
+        self._compress = torch.compile(self._compress, mode=mode)
+        self.hasher.forward = torch.compile(self.hasher.forward, mode=mode)
+        self._fetch = torch.compile(self._fetch, mode=mode)
+        self._gate = torch.compile(self._gate, mode=mode)
+        self._value = torch.compile(self._value, mode=mode)
+        self.short_conv.forward = torch.compile(self.short_conv.forward, mode=mode)
+
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor):
         """``hidden_states`` [B, T, n_embd], ``input_ids`` [B, T] raw ids."""
         # the hasher consumes *compressed* ids
         with record_function("engram/compress"):
-            compressed = self.lookup_table[input_ids.to(self.lookup_table.device)]
+            compressed = self._compress(input_ids)
         with record_function("engram/hash"):
             hash_ids = self.hasher(compressed)  # [B, T, H]
         with record_function("engram/fetch"):
-            embeddings = self.multi_head_embedding(
-                hash_ids + self.table_offsets
-            ).flatten(start_dim=-2)
-
-        # one gate over the whole stream, replacing upstream's per-slice
-        # (hc_mult) gates: |cos| between the memory key and the residual
-        # stream, mapped to a multiplicative factor ~ sqrt(|cos|)
+            embeddings = self._fetch(hash_ids)
         with record_function("engram/gate"):
-            key = self.norm1(self.key_proj(embeddings))
-            query = self.norm2(hidden_states)
-            gate = (key * query).sum(dim=-1) / math.sqrt(hidden_states.size(-1))
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-
+            gate = self._gate(embeddings, hidden_states)
         with record_function("engram/value"):
-            value = gate * self.value_proj(embeddings)
+            value = self._value(embeddings, gate)
         with record_function("engram/short_conv"):
             conv = self.short_conv(value)
         return value + conv
