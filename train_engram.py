@@ -31,6 +31,8 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from torch.profiler import record_function
+from profiling import build_profiler
 from dataclasses import asdict
 from pathlib import Path
 
@@ -59,6 +61,12 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2-engram' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
+# a corpus in this repo's trace format (artifacts/corpus/<name>: tokens.bin + meta.json),
+# read as the access trace reads it: consecutive, non-overlapping sequences in file
+# order. Empty keeps nanoGPT's data/<dataset> random-window loader. The corpus has no
+# split, so its last corpus_val_tokens serve as val.
+corpus_dir = ''
+corpus_val_tokens = 1000000
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -101,6 +109,10 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # torch.compile needs triton (no Windows wheels); see module docstring
+# profiling: per-component time of a gradient step -> out_dir/profile.md (see profiling.py)
+profile = False
+profile_warmup = 5 # steps skipped before the profiler starts recording
+profile_steps = 5 # steps recorded; the table is written when they are done
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -152,12 +164,37 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    return to_device(x, y)
+
+def to_device(x, y):
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        return x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    return x.to(device), y.to(device)
+
+if corpus_dir:
+    from efficient_engram.data.corpus import load_meta, open_tokens
+    corpus_meta = load_meta(directory=Path(corpus_dir))
+    corpus_tokens = open_tokens(directory=Path(corpus_dir))
+    corpus_split_at = corpus_meta.n_tokens - corpus_val_tokens
+    corpus_cursor = {'train': 0, 'val': corpus_split_at}
+    corpus_end = {'train': corpus_split_at, 'val': corpus_meta.n_tokens}
+    def get_batch(split):
+        """Step k of a split is sequences k*B .. k*B+B-1 of the packed stream, each
+        block_size tokens, exactly the trace's reading order; y is x shifted by one.
+        Train raises when the corpus runs out; val wraps around."""
+        per_step = batch_size * block_size
+        start = corpus_cursor[split]
+        if start + per_step + 1 > corpus_end[split]:
+            if split == 'train':
+                raise ValueError(f"train corpus exhausted at token {start}: "
+                                 f"{corpus_end['train']} tokens hold {corpus_end['train'] // per_step} steps")
+            start = corpus_split_at
+        corpus_cursor[split] = start + per_step
+        block = np.asarray(corpus_tokens[start:start + per_step + 1], dtype=np.int64)
+        x = torch.from_numpy(block[:-1]).view(batch_size, block_size)
+        y = torch.from_numpy(block[1:]).view(batch_size, block_size)
+        return to_device(x, y)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -168,7 +205,13 @@ meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 corpus_tokenizer_name = None
 corpus_dtype = np.uint16  # GPT-2/shakespeare-char fit in uint16
-if os.path.exists(meta_path):
+if corpus_dir:
+    from transformers import AutoTokenizer
+    corpus_tokenizer_name = corpus_meta.tokenizer_name_or_path
+    meta_vocab_size = len(AutoTokenizer.from_pretrained(corpus_tokenizer_name, trust_remote_code=True))
+    print(f"corpus {corpus_dir}: {corpus_meta.n_tokens:,} tokens of {corpus_meta.dataset}, "
+          f"tokenizer {corpus_tokenizer_name}, vocab_size {meta_vocab_size}, last {corpus_val_tokens:,} tokens are val")
+elif os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
@@ -355,6 +398,8 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+profiler = build_profiler(out_dir, profile_warmup, profile_steps) if profile and master_process else nullcontext()
+profiler.__enter__()
 while True:
 
     # determine and set the learning rate for this iteration
@@ -392,6 +437,8 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    step_span = record_function("step")
+    step_span.__enter__()
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -405,16 +452,21 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+        with record_function("backward"):
+            scaler.scale(loss).backward()
+    with record_function("optimizer"):
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+    step_span.__exit__(None, None, None)
+    if profile and master_process:
+        profiler.step()
 
     # timing and logging
     t1 = time.time()
@@ -435,5 +487,6 @@ while True:
     if iter_num > max_iters:
         break
 
+profiler.__exit__(None, None, None)
 if ddp:
     destroy_process_group()

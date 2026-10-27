@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 
 from engram import EngramMemoryConfig, build_engram_layers
 from model import GPT, GPTConfig
@@ -99,26 +100,29 @@ class GPTWithEngram(GPT):
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        with record_function("fwd/embed"):
+            tok_emb = self.transformer.wte(idx)
+            pos_emb = self.transformer.wpe(pos)
+            x = self.transformer.drop(tok_emb + pos_emb)
         for layer_id, block in enumerate(self.transformer.h):
             memory = self._engram_at(layer_id)
             if memory is not None:
                 # upstream injects the memory before the block, on the
                 # residual stream (hidden = engram(hidden, ids) + hidden)
-                x = x + memory(hidden_states=x, input_ids=idx)
-            x = block(x)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
-        else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
+                with record_function("fwd/engram"):
+                    x = x + memory(hidden_states=x, input_ids=idx)
+            with record_function("fwd/block"):
+                x = block(x)
+        with record_function("fwd/head"):
+            x = self.transformer.ln_f(x)
+            if targets is not None:
+                logits = self.lm_head(x)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+                )
+            else:
+                logits = self.lm_head(x[:, [-1], :])
+                loss = None
 
         return logits, loss
 

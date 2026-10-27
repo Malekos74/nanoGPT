@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.profiler import record_function
 
 from efficient_engram.hashing.ngram_hash_torch import NgramHasher
 from model import LayerNorm
@@ -106,6 +107,8 @@ class EngramMemory(nn.Module):
         self.layer_id = layer_id
         self.config = config
 
+        # a submodule, so its constants move with the model and the whole
+        # compress -> hash -> gather chain runs on the table's device
         self.hasher = NgramHasher.from_reference(
             mapping=mapping, layer_id=layer_id, device="cpu"
         )
@@ -143,27 +146,31 @@ class EngramMemory(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor):
         """``hidden_states`` [B, T, n_embd], ``input_ids`` [B, T] raw ids."""
-        # the hasher consumes *compressed* ids; compression and hashing
-        # both happen on the hasher's device, so no sync is needed until
-        # the fetched rows come back
-        compressed = self.lookup_table[input_ids.to(self.lookup_table.device)]
-        hash_ids = self.hasher(compressed)  # [B, T, H]
-        embeddings = self.multi_head_embedding(
-            hash_ids.to(self.multi_head_embedding.weight.device)
-            + self.table_offsets.to(hash_ids.device)
-        ).flatten(start_dim=-2)
+        # the hasher consumes *compressed* ids
+        with record_function("engram/compress"):
+            compressed = self.lookup_table[input_ids.to(self.lookup_table.device)]
+        with record_function("engram/hash"):
+            hash_ids = self.hasher(compressed)  # [B, T, H]
+        with record_function("engram/fetch"):
+            embeddings = self.multi_head_embedding(
+                hash_ids + self.table_offsets
+            ).flatten(start_dim=-2)
 
         # one gate over the whole stream, replacing upstream's per-slice
         # (hc_mult) gates: |cos| between the memory key and the residual
         # stream, mapped to a multiplicative factor ~ sqrt(|cos|)
-        key = self.norm1(self.key_proj(embeddings))
-        query = self.norm2(hidden_states)
-        gate = (key * query).sum(dim=-1) / math.sqrt(hidden_states.size(-1))
-        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        gate = gate.sigmoid().unsqueeze(-1)
+        with record_function("engram/gate"):
+            key = self.norm1(self.key_proj(embeddings))
+            query = self.norm2(hidden_states)
+            gate = (key * query).sum(dim=-1) / math.sqrt(hidden_states.size(-1))
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+            gate = gate.sigmoid().unsqueeze(-1)
 
-        value = gate * self.value_proj(embeddings)
-        return value + self.short_conv(value)
+        with record_function("engram/value"):
+            value = gate * self.value_proj(embeddings)
+        with record_function("engram/short_conv"):
+            conv = self.short_conv(value)
+        return value + conv
 
 
 def build_engram_layers(
