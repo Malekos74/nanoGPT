@@ -31,6 +31,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -176,6 +177,11 @@ if os.path.exists(meta_path):
     # records the dtype it was written with so get_batch reads it back
     dtype_name = meta.get('dtype', 'uint16')
     corpus_dtype = getattr(np, dtype_name)
+    if meta_vocab_size > np.iinfo(corpus_dtype).max + 1:
+        raise ValueError(
+            f"vocab_size {meta_vocab_size} does not fit the corpus dtype {dtype_name}; "
+            f"meta.pkl must record the dtype the .bin files were written with"
+        )
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
     print(f"corpus tokenizer: {corpus_tokenizer_name or '(none)'}")
     print(f"corpus dtype: {dtype_name}")
@@ -240,7 +246,7 @@ if engram_config is not None:
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  engram=engram_config) # start with model_args from command line
+                  engram=asdict(engram_config) if engram_config is not None else None) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -248,7 +254,7 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTEngramConfig(**model_args)
+    gptconf = GPTEngramConfig(**{**model_args, 'engram': engram_config})
     model = GPTWithEngram(gptconf, mapping=engram_mapping)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -262,10 +268,11 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # rebuild the mapping before the model: the checkpoint's engram
     # section travels with model_args, and GPTWithEngram needs it
-    engram_config = model_args['engram']
+    # the checkpoint holds the engram section as a dict (torch.load is weights-only)
+    engram_config = EngramMemoryConfig(**model_args['engram']) if model_args['engram'] is not None else None
     engram_mapping = build_hash_mapping_for_engram(engram_config) if engram_config is not None else None
     # create the model
-    gptconf = GPTEngramConfig(**model_args)
+    gptconf = GPTEngramConfig(**{**model_args, 'engram': engram_config})
     model = GPTWithEngram(gptconf, mapping=engram_mapping)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(

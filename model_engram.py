@@ -77,6 +77,10 @@ class GPTWithEngram(GPT):
                  backbone_hidden_size=config.n_embd,
              ).items()}
         )
+        # GPT.__init__ ran _init_weights before these modules existed, so
+        # without this the tables and projections keep PyTorch's default
+        # init (tables at std 1.0 vs 0.02 everywhere else)
+        self.engram_layers.apply(self._init_weights)
 
     @property
     def engram_config(self) -> EngramMemoryConfig | None:
@@ -118,6 +122,26 @@ class GPTWithEngram(GPT):
 
         return logits, loss
 
+    def engram_table_params(self) -> int:
+        if self.engram_layers is None:
+            return 0
+        return sum(
+            p.numel() for module in self.engram_layers.values()
+            for p in module.multi_head_embedding.parameters()
+        )
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """GPT's PaLM-style estimate, with the memory tables left out of the
+        dense-parameter term: a row lookup is a gather, not a matmul. The
+        projections, gate and short conv are ordinary parameters and stay in."""
+        N = self.get_num_params() - self.engram_table_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_iter = flops_per_token * T * fwdbwd_per_iter
+        flops_promised = 312e12  # A100 bfloat16 peak, as in GPT.estimate_mfu
+        return flops_per_iter * (1.0 / dt) / flops_promised
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """GPT's two groups, plus a third for the memory tables.
 
@@ -135,7 +159,7 @@ class GPTWithEngram(GPT):
         # the Engram tables are 2-D, so GPT's own split would put them
         # in the decay group; carve them out by name into their own group
         engram_names = {
-            n for n in param_dict if ".engram_layers." in n
+            n for n in param_dict if n.startswith("engram_layers.")
             and ".multi_head_embedding." in n
         }
         decay_params = [

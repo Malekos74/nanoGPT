@@ -48,6 +48,7 @@ val_ids.tofile(os.path.join(out_dir, 'val.bin'))
 meta = {
     'vocab_size': len(tokenizer),
     'tokenizer_name_or_path': 'deepseek-ai/DeepSeek-V3',
+    'dtype': 'int32',  # train_engram.py reads the .bin files with this dtype
 }
 with open(os.path.join(out_dir, 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
