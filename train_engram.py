@@ -90,6 +90,7 @@ engram_vocab_size_per_ngram = [1131200, 1131200] # rows per head table, per n-gr
 engram_pad_id = 2 # <|_pad|> for DeepSeek-V3, as in the reference
 engram_hash_seed = 0
 engram_kernel_size = 4
+engram_table_device = '' # '' keeps the tables with the model; 'cpu' offloads them to host DRAM
 # the pinned upstream implementation; relative to this file's directory
 engram_repo = str(Path(__file__).resolve().parent.parent / 'engram')
 engram_repo_sha = 'fb7f84a21f91223715394a33a1dc24bbfb7f788e'
@@ -249,6 +250,7 @@ def build_engram_config() -> EngramMemoryConfig | None:
         pad_id=engram_pad_id,
         hash_seed=engram_hash_seed,
         kernel_size=engram_kernel_size,
+        table_device=engram_table_device,
     )
 
 def build_hash_mapping_for_engram(engram_config: EngramMemoryConfig):
@@ -341,6 +343,7 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+model.place_tables() # offloaded tables go back to their device
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -455,16 +458,18 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        with record_function("step/data"):
+            X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         with record_function("backward"):
             scaler.scale(loss).backward()
     with record_function("optimizer"):
         # clip the gradient
-        if grad_clip != 0.0:
-            for opt in optimizers.values():
-                scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        with record_function("optimizer/clip"):
+            if grad_clip != 0.0:
+                for opt in optimizers.values():
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         # step the optimizers and the scaler if training in fp16
         for name, opt in optimizers.items():
             # muon and adamw together are the backbone's update; the tables are their own row
@@ -472,8 +477,9 @@ while True:
                 scaler.step(opt)
         scaler.update()
         # flush the gradients as soon as we can, no need for this memory anymore
-        for opt in optimizers.values():
-            opt.zero_grad(set_to_none=True)
+        with record_function("optimizer/zero_grad"):
+            for opt in optimizers.values():
+                opt.zero_grad(set_to_none=True)
     if profile and master_process and device_type == 'cuda':
         # drain the GPU at the step boundary while profiling: otherwise the window
         # opens with up to a launch queue's worth of the previous step's kernels

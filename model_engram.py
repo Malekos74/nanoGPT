@@ -62,8 +62,12 @@ class _ExitRange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        _OPEN_RANGES.pop(ctx.name).__exit__(None, None, None)
+        _close_range(ctx.name)
         return grad, None
+
+
+def _close_range(name: str) -> None:
+    _OPEN_RANGES.pop(name).__exit__(None, None, None)
 
 
 @dataclass
@@ -98,6 +102,7 @@ class GPTWithEngram(GPT):
         self.config = config
         if config.engram is None:
             self.engram_layers = None
+            self._register_embedding_backward_range()
             return
         if mapping is None:
             raise ValueError(
@@ -116,6 +121,7 @@ class GPTWithEngram(GPT):
                  backbone_hidden_size=config.n_embd,
              ).items()}
         )
+        self._register_embedding_backward_range()
         # GPT.__init__ ran _init_weights before these modules existed, so
         # without this the tables and projections keep PyTorch's default
         # init (tables at std 1.0 vs 0.02 everywhere else)
@@ -130,6 +136,15 @@ class GPTWithEngram(GPT):
             return None
         return self.engram_layers._modules.get(str(layer_id))
 
+    def _register_embedding_backward_range(self) -> None:
+        # the token embedding has no input tensor to hang an _ExitRange on, so
+        # its backward range (opened by the marker on the embedding's output)
+        # closes when the embedding weight's gradient has been accumulated,
+        # which is the last thing autograd does with it
+        self.transformer.wte.weight.register_post_accumulate_grad_hook(
+            lambda _param: _close_range("bwd/embedding")
+        )
+
     # Regions are methods so that ``compile_regions`` can compile each one on
     # its own; the labels and backward markers in ``forward`` stay eager.
     def _embed(self, idx, pos):
@@ -141,6 +156,13 @@ class GPTWithEngram(GPT):
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
         )
         return logits, loss
+
+    def place_tables(self) -> None:
+        """Offload the memory tables after ``model.to(device)`` when the Engram
+        config asks for it (``table_device``); a no-op otherwise."""
+        if self.engram_layers is not None:
+            for module in self.engram_layers.values():
+                module.place_table()
 
     def compile_regions(self, mode: str) -> None:
         """torch.compile the embedding, every block, the head and each Engram
@@ -165,7 +187,7 @@ class GPTWithEngram(GPT):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         with record_function("fwd/backbone"):
-            x = self._embed(idx, pos)
+            x = _EnterRange.apply(self._embed(idx, pos), "bwd/embedding")
         for layer_id, block in enumerate(self.transformer.h):
             memory = self._engram_at(layer_id)
             if memory is not None:
@@ -173,7 +195,8 @@ class GPTWithEngram(GPT):
                 # residual stream (hidden = engram(hidden, ids) + hidden)
                 with record_function("fwd/engram"):
                     out = memory(hidden_states=_ExitRange.apply(x, "bwd/engram"), input_ids=idx)
-                    x = x + _EnterRange.apply(out, "bwd/engram")
+                    with record_function("engram/residual_add"):
+                        x = x + _EnterRange.apply(out, "bwd/engram")
             with record_function("fwd/backbone"):
                 x = _EnterRange.apply(block(_ExitRange.apply(x, "bwd/backbone")), "bwd/backbone")
         with record_function("fwd/backbone"):
@@ -243,8 +266,10 @@ class GPTWithEngram(GPT):
             ),
         }
         if table_params:  # a plain GPT (engram=None) has no tables to step
+            # fused AdamW also has a CPU kernel, for offloaded tables
             optimizers["tables"] = torch.optim.AdamW(
-                table_params, lr=learning_rate, betas=betas, weight_decay=0.0, **extra_args,
+                table_params, lr=learning_rate, betas=betas, weight_decay=0.0,
+                fused=fused_available,
             )
         print(f"using fused AdamW: {use_fused}")
         return optimizers

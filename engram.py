@@ -41,6 +41,9 @@ class EngramMemoryConfig:
     pad_id: int = 2  # <|_pad|> for the DeepSeek-V3 tokenizer
     hash_seed: int = 0
     kernel_size: int = 4
+    # where the memory tables live: '' keeps them with the model, 'cpu' offloads
+    # them to host DRAM (rows are gathered there and copied to the model's device)
+    table_device: str = ''
 
     def __post_init__(self):
         expected = self.max_ngram_size - 1
@@ -151,7 +154,18 @@ class EngramMemory(nn.Module):
         return self.lookup_table[input_ids.to(self.lookup_table.device)]
 
     def _fetch(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        return self.multi_head_embedding(hash_ids + self.table_offsets).flatten(start_dim=-2)
+        table = self.multi_head_embedding.weight.device
+        rows = self.multi_head_embedding(hash_ids.to(table) + self.table_offsets)
+        # with offloaded tables this is the host-to-device copy of the rows; the
+        # gradient takes the reverse path through autograd
+        return rows.to(hash_ids.device).flatten(start_dim=-2)
+
+    def place_table(self) -> None:
+        """Move the table (and its offsets) to ``config.table_device`` if one is
+        set; call after ``model.to(device)``, which moves everything together."""
+        if self.config.table_device:
+            self.multi_head_embedding.to(self.config.table_device)
+            self.table_offsets = self.table_offsets.to(self.config.table_device)
 
     def _gate(self, embeddings: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         # one gate over the whole stream, replacing upstream's per-slice
@@ -170,7 +184,8 @@ class EngramMemory(nn.Module):
         """torch.compile each sub-step separately, keeping the labels between them."""
         self._compress = torch.compile(self._compress, mode=mode)
         self.hasher.forward = torch.compile(self.hasher.forward, mode=mode)
-        self._fetch = torch.compile(self._fetch, mode=mode)
+        if not self.config.table_device:  # a cross-device gather stays eager
+            self._fetch = torch.compile(self._fetch, mode=mode)
         self._gate = torch.compile(self._gate, mode=mode)
         self._value = torch.compile(self._value, mode=mode)
         self.short_conv.forward = torch.compile(self.short_conv.forward, mode=mode)
@@ -188,9 +203,8 @@ class EngramMemory(nn.Module):
             gate = self._gate(embeddings, hidden_states)
         with record_function("engram/value"):
             value = self._value(embeddings, gate)
-        with record_function("engram/short_conv"):
-            conv = self.short_conv(value)
-        return value + conv
+        with record_function("engram/short_conv"):  # the conv and its sum into the value
+            return value + self.short_conv(value)
 
 
 def build_engram_layers(
