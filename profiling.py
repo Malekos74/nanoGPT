@@ -37,6 +37,7 @@ engine's first node runs (see ``_add_engine_start``).
 
 import json
 import os
+import statistics
 from collections import defaultdict
 
 import torch
@@ -61,8 +62,8 @@ COMPONENTS = [
     "bwd/engine start",
     "bwd/backbone",
     "bwd/embedding",
-    "bwd/engram",
     "bwd/table_grad",
+    "bwd/engram",
     "optimizer",
     "optimizer/clip",
     "optimizer/backbone",
@@ -76,14 +77,23 @@ PARENTS = {
              "backward", "optimizer"],
     "fwd/engram": ["engram/compress", "engram/hash", "engram/fetch", "engram/gate",
                    "engram/value", "engram/short_conv", "engram/residual_add"],
-    "backward": ["bwd/engine start", "bwd/backbone", "bwd/embedding", "bwd/engram",
-                 "bwd/table_grad"],
+    # table_grad before engram: the table's backward is counted in full, whether it
+    # runs on the calling thread beside the copy (eager) or inside bwd/engram (pinned)
+    "backward": ["bwd/engine start", "bwd/backbone", "bwd/embedding", "bwd/table_grad",
+                 "bwd/engram"],
     "optimizer": ["optimizer/clip", "optimizer/backbone", "optimizer/tables",
                   "optimizer/zero_grad"],
 }
 DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
 COPY_DIRECTIONS = ("h2d", "d2h", "d2d")
 LAUNCH_CALLS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel", "cuLaunchKernelEx")
+# runtime calls in which the host does nothing but wait for the device (a
+# pageable memcpy is one long blocking call whose host-side staging is part of
+# the transfer, so it counts as communication, not host work)
+WAIT_CALLS = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize",
+              "cudaMemcpy", "cudaMemcpyAsync")
+# the exclusive split of a step's wall time, see ``partition_step``
+PARTITION = ("gpu", "copy", "host", "launch", "data", "host_copy", "idle")
 # a kernel launch normally returns in a few microseconds; one that takes this
 # many times the typical duration was blocked on a full launch queue, i.e. the
 # host was waiting for the GPU, not working
@@ -116,15 +126,20 @@ def copy_direction(name: str) -> str | None:
     return None
 
 
-def attribute(trace_path: str) -> tuple[dict, dict, float, dict]:
-    """Sum host time, device time and copies per range name from the chrome trace.
+def attribute(trace_path: str) -> tuple[dict, dict, float, dict, list]:
+    """``attribute_events`` over a whole chrome trace."""
+    return attribute_events(json.load(open(trace_path))["traceEvents"])
 
-    Returns ``(host, device, all_device_us, launch_wait)``: ``host[name] = {"us",
-    "count"}``; ``device[name] = {"us", "h2d": {"us", "bytes", "count"}, ...}``;
-    ``launch_wait[name]`` is the host time inside the range spent blocked in
-    kernel launches (``launch_wait["all"]`` over every thread).
+
+def attribute_events(events: list) -> tuple[dict, dict, float, dict, list]:
+    """Sum host time, device time and copies per range name over ``events``.
+
+    Returns ``(host, device, all_device_us, launch_wait, intervals)``:
+    ``host[name] = {"us", "count"}``; ``device[name] = {"us", "h2d": {"us",
+    "bytes", "count"}, ...}``; ``launch_wait[name]`` is the host time inside the
+    range spent blocked in kernel launches (``launch_wait["all"]`` over every
+    thread); ``intervals`` are the host ranges as ``(ts, te, name)``.
     """
-    events = json.load(open(trace_path))["traceEvents"]
     ranges = defaultdict(list)  # tid -> [(ts, te, name)]
     host = defaultdict(lambda: {"us": 0.0, "count": 0})
     for e in events:
@@ -281,18 +296,111 @@ def project_host_time(intervals: list) -> dict:
     return host_us
 
 
-def write_report(prof: profile, out_dir: str, active_steps: int) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    prof.export_chrome_trace(os.path.join(out_dir, "profile_trace.json"))
-    peak_gib = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None
-    report_from_trace(out_dir, active_steps, peak_gib)
+def _host_work_intervals(events: list, steps: list[Interval], typical_launch: float) -> list[Interval]:
+    """When at least one host thread is doing work: the step's own labelled ranges
+    (not ``backward``, in which the calling thread only waits for the autograd
+    thread, whose work the cpu ops cover) and every cpu op, minus the calls in
+    which a thread is blocked on the device."""
+    work, waits = [], []
+    for e in events:
+        if "ts" not in e or "dur" not in e:
+            continue
+        iv = (e["ts"], e["ts"] + e["dur"])
+        cat, name = e.get("cat"), e["name"]
+        if cat == "user_annotation" and name in ("step/sync",):
+            waits.append(iv)
+        elif cat == "cpu_op" or (cat == "user_annotation" and name not in ("step", "backward")
+                                 and not name.startswith("ProfilerStep")):
+            work.append(iv)
+        elif cat in ("cuda_runtime", "cuda_driver") and name in WAIT_CALLS:
+            waits.append(iv)
+        elif cat in ("cuda_runtime", "cuda_driver") and name in LAUNCH_CALLS \
+                and e["dur"] > BLOCKED_LAUNCH_FACTOR * typical_launch:
+            waits.append((iv[0] + typical_launch, iv[1]))
+    return _subtract(_merge(_clip(work, steps)), _merge(waits))
 
 
-def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -> None:
-    """Build ``profile.md`` from an exported ``profile_trace.json`` (also usable offline)."""
-    host, device, all_device_us, launch_wait, intervals = attribute(
-        os.path.join(out_dir, "profile_trace.json")
-    )
+def _part(active: tuple, in_data: bool) -> str:
+    if not active:
+        return "idle"
+    if "host" not in active:
+        return "gpu" if "gpu" in active else "copy"  # a copy beside a kernel counts as compute
+    if len(active) == 1:
+        return "host"
+    if in_data:
+        return "data"
+    return "launch" if "gpu" in active else "host_copy"
+
+
+def step_windows(events: list) -> list[Interval]:
+    """The recorded steps' ``step`` ranges, in order."""
+    steps = _merge([(e["ts"], e["ts"] + e["dur"]) for e in events
+                    if e.get("cat") == "user_annotation" and e["name"] == "step"])
+    if not steps:
+        raise ValueError("no step ranges in the trace")
+    return steps
+
+
+def partition_steps(events: list, steps: list[Interval]) -> list[dict[str, float]]:
+    """Split each step's wall time into exclusive parts, in microseconds, one
+    dict per step: ``gpu`` (a kernel runs, the host waits), ``copy`` (a memcpy
+    runs, nothing else), ``host`` (a host thread works, the device is idle),
+    ``launch`` (the host works while the GPU computes: it is ahead, launching
+    kernels and the glue around them), ``data`` (the batch is loaded while the
+    device is busy), ``host_copy`` (the host works while only a transfer is in
+    flight) and ``idle`` (nothing runs)."""
+    launches = sorted(e["dur"] for e in events
+                      if e.get("cat") in ("cuda_runtime", "cuda_driver") and e["name"] in LAUNCH_CALLS)
+    typical = launches[len(launches) // 2] if launches else 0.0
+    lanes = {
+        "gpu": _merge(_clip([(e["ts"], e["ts"] + e["dur"]) for e in events
+                             if e.get("cat") in ("kernel", "gpu_memset")], steps)),
+        "copy": _merge(_clip([(e["ts"], e["ts"] + e["dur"]) for e in events
+                              if e.get("cat") == "gpu_memcpy"], steps)),
+        "host": _host_work_intervals(events, steps, typical),
+    }
+    data = _merge([(e["ts"], e["ts"] + e["dur"]) for e in events
+                   if e.get("cat") == "user_annotation" and e["name"] == "step/data"])
+    per_step = []
+    for ws, we in steps:
+        totals = dict.fromkeys(PARTITION, 0.0)
+        points = sorted({ws, we} | {p for iv in [*lanes.values(), data] for s, e in iv
+                                    for p in (s, e) if ws < p < we})
+        for lo, hi in zip(points, points[1:], strict=False):
+            active = tuple(lane for lane, iv in lanes.items()
+                           if any(s <= lo and hi <= e for s, e in iv))
+            in_data = any(s <= lo and hi <= e for s, e in data)
+            totals[_part(active, in_data)] += hi - lo
+        per_step.append(totals)
+    return per_step
+
+
+def partition_step(trace_path: str) -> dict[str, float]:
+    """``partition_steps`` over a whole trace, averaged over its steps."""
+    events = json.load(open(trace_path))["traceEvents"]
+    per_step = partition_steps(events, step_windows(events))
+    return {k: sum(s[k] for s in per_step) / len(per_step) for k in PARTITION}
+
+
+def events_in_step(events: list, window: Interval) -> list:
+    """The events of one step: host-side events that start inside the window
+    and the device events launched from them (the GPU is drained at every step
+    boundary, so a step's device work is launched inside its window)."""
+    ws, we = window
+    inside = [e for e in events if "ts" in e and e.get("cat") not in DEVICE_CATEGORIES
+              and ws <= e["ts"] < we]
+    correlations = {e["args"]["correlation"] for e in inside
+                    if e.get("cat") in ("cuda_runtime", "cuda_driver") and "correlation" in e.get("args", {})}
+    device = [e for e in events if e.get("cat") in DEVICE_CATEGORIES
+              and e.get("args", {}).get("correlation") in correlations]
+    return inside + device
+
+
+def step_components(events: list) -> tuple[dict, dict]:
+    """The report's rows for one step's events: ``(host, device)`` after the
+    host-time projection, the launch-wait subtraction, the derived device rows
+    and the computed ``<parent>/other`` rows."""
+    host, device, all_device_us, launch_wait, intervals = attribute_events(events)
     for name, us in project_host_time(intervals).items():
         host[name]["us"] = us
     # the wait is the step's, not the range's that happened to fill the queue:
@@ -308,32 +416,6 @@ def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -
     # autograd launches from its own thread, outside every host range of the step
     device["backward"]["us"] = all_device_us - device["step"]["us"]
     device["step"]["us"] = all_device_us
-    step_host_us, step_device_us = host["step"]["us"], max(all_device_us, 1.0)
-
-    rows = ["| component | calls/step | CPU ms/step | CPU % | CUDA ms/step | CUDA % |",
-            "|---|---:|---:|---:|---:|---:|"]
-
-    def row(label, count, cpu_us, dev_us):
-        dev_us = 0.0 if abs(dev_us) < 1.0 else dev_us  # sub-microsecond rounding dust
-        cpu_us = None if cpu_us is None else (0.0 if abs(cpu_us) < 1.0 else cpu_us)
-        cpu = f"{cpu_us / 1e3 / active_steps:.2f} | {100 * cpu_us / step_host_us:.1f}" if cpu_us is not None else " | "
-        rows.append(f"| {label} | {count / active_steps:g} | {cpu} "
-                    f"| {dev_us / 1e3 / active_steps:.2f} | {100 * dev_us / step_device_us:.1f} |")
-
-    top_level = {"step", "fwd/backbone", "fwd/engram", "backward", "optimizer"}
-
-    def emit(name, label):
-        indent = "" if name in top_level else "&nbsp;&nbsp;"
-        row(indent + label, host[name]["count"], host[name]["us"], device[name]["us"])
-        for direction in COPY_DIRECTIONS:
-            copy = device[name][direction]
-            if copy["count"] == 0 and name != "step":
-                continue  # every range gets copy rows once it has any; step always
-            mb = copy["bytes"] / 1e6 / active_steps
-            row(f"{indent}&nbsp;&nbsp;· {direction} copies, {mb:.2f} MB", copy["count"], None, copy["us"])
-
-    # computed remainders, printed right after the parent's last child
-    other_after = {}
     for parent, kids in PARENTS.items():
         if parent not in host:
             continue
@@ -344,18 +426,118 @@ def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -
             "count": host[parent]["count"],
         }
         device[other]["us"] = device[parent]["us"] - sum(device[k]["us"] for k in present)
+    return host, device
+
+
+def _aggregate(per_step: list[tuple[dict, dict]], stat) -> tuple[dict, dict]:
+    """Combine per-step ``(host, device)`` dicts with ``stat`` over the steps
+    (a name absent from a step counts as zero there)."""
+    def fresh() -> dict:
+        return {"us": 0.0, **{d: {"us": 0.0, "bytes": 0, "count": 0} for d in COPY_DIRECTIONS}}
+
+    names = [n for n in COMPONENTS if any(n in h for h, _ in per_step)]
+    names += [n for h, _ in per_step for n in h if n not in names and n.endswith("/other")]
+    host, device = {}, defaultdict(fresh)
+    for name in dict.fromkeys(names):
+        host[name] = {
+            "us": stat([h[name]["us"] if name in h else 0.0 for h, _ in per_step]),
+            "count": stat([h[name]["count"] if name in h else 0 for h, _ in per_step]),
+        }
+        device[name]["us"] = stat([d[name]["us"] if name in d else 0.0 for _, d in per_step])
+        for direction in COPY_DIRECTIONS:
+            for field in ("us", "bytes", "count"):
+                device[name][direction][field] = stat(
+                    [d[name][direction][field] if name in d else 0 for _, d in per_step])
+    return host, device
+
+
+def _std(values: list[float]) -> float:
+    return statistics.stdev(values) if len(values) > 1 else 0.0
+
+
+def _table(host: dict, device: dict, spread: tuple[dict, dict] | None) -> list[str]:
+    """Markdown rows of the component table from aggregated ``(host, device)``;
+    with ``spread`` (another aggregate, the std), each time cell gets a ± column
+    instead of a share column."""
+    step_host_us, step_device_us = host["step"]["us"], max(device["step"]["us"], 1.0)
+    if spread is None:
+        rows = ["| component | calls/step | CPU ms/step | CPU % | CUDA ms/step | CUDA % |"]
+    else:
+        rows = ["| component | calls/step | CPU ms/step | ± std | CUDA ms/step | ± std |"]
+    rows.append("|---|---:|---:|---:|---:|---:|")
+
+    def cell(us: float | None, share_of: float, name: str, kind: str) -> str:
+        if us is None:
+            return " | "
+        us = 0.0 if abs(us) < 1.0 else us  # sub-microsecond rounding dust
+        if spread is None:
+            return f"{us / 1e3:.2f} | {100 * us / share_of:.1f}"
+        std = spread[0][name]["us"] if kind == "cpu" else spread[1][name]["us"]
+        return f"{us / 1e3:.2f} | {std / 1e3:.2f}"
+
+    def copy_cell(name: str, direction: str) -> str:
+        us = device[name][direction]["us"]
+        if spread is None:
+            return f"{us / 1e3:.2f} | {100 * us / step_device_us:.1f}"
+        return f"{us / 1e3:.2f} | {spread[1][name][direction]['us'] / 1e3:.2f}"
+
+    top_level = {"step", "fwd/backbone", "fwd/engram", "backward", "optimizer"}
+
+    def emit(name: str) -> None:
+        indent = "" if name in top_level else "&nbsp;&nbsp;"
+        rows.append(f"| {indent}{name} | {host[name]['count']:g} | "
+                    f"{cell(host[name]['us'], step_host_us, name, 'cpu')} | "
+                    f"{cell(device[name]['us'], step_device_us, name, 'cuda')} |")
+        for direction in COPY_DIRECTIONS:
+            copy = device[name][direction]
+            if copy["count"] == 0 and name != "step":
+                continue  # every range gets copy rows once it has any; step always
+            rows.append(f"| {indent}&nbsp;&nbsp;· {direction} copies, {copy['bytes'] / 1e6:.2f} MB "
+                        f"| {copy['count']:g} |  |  | {copy_cell(name, direction)} |")
+
+    # computed remainders print right after the parent's last child
+    other_after = {}
+    for parent, kids in PARENTS.items():
+        if parent not in host:
+            continue
+        present = [k for k in kids if k in host]
         last = present[-1] if present else parent
-        # if the last child is itself a parent, wait for that child's own remainder
-        other_after[last + "/other" if last in PARENTS else last] = other
+        other_after[last + "/other" if last in PARENTS else last] = parent + "/other"
     for name in COMPONENTS:
         if name not in host:
             continue
-        emit(name, name)
+        emit(name)
         while name in other_after:
             name = other_after[name]
-            emit(name, name)
+            emit(name)
+    return rows
 
-    lines = [f"Profile of {active_steps} training steps (after warmup).", ""] + rows
+
+def write_report(prof: profile, out_dir: str, active_steps: int) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    prof.export_chrome_trace(os.path.join(out_dir, "profile_trace.json"))
+    peak_gib = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None
+    report_from_trace(out_dir, active_steps, peak_gib)
+
+
+def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -> None:
+    """Build ``profile.md`` (the mean over the recorded steps, then the median
+    with the std across steps) and ``steps.json`` (every step's rows and its
+    wall-time partition) from an exported ``profile_trace.json``."""
+    events = json.load(open(os.path.join(out_dir, "profile_trace.json")))["traceEvents"]
+    steps = step_windows(events)
+    if len(steps) != active_steps:
+        raise ValueError(f"expected {active_steps} recorded steps, the trace has {len(steps)}")
+    per_step = [step_components(events_in_step(events, w)) for w in steps]
+    parts = partition_steps(events, steps)
+    mean = _aggregate(per_step, statistics.fmean)
+    median = _aggregate(per_step, statistics.median)
+    std = _aggregate(per_step, _std)
+
+    lines = [f"Profile of {active_steps} training steps (after warmup), mean per step.", ""]
+    lines += _table(*mean, spread=None)
+    lines += ["", f"Median per step over the {active_steps} steps, with the std across them.", ""]
+    lines += _table(*median, spread=std)
     if peak_gib is not None:
         lines += ["", f"Peak CUDA memory allocated: {peak_gib:.2f} GiB"]
     report = "\n".join(lines) + "\n"
@@ -363,3 +545,15 @@ def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -
         f.write(report)
     print(report)
     print(f"profile written to {os.path.join(out_dir, 'profile.md')}")
+
+    per_step_ms = [
+        {name: {"cpu_ms": h[name]["us"] / 1e3, "cuda_ms": d[name]["us"] / 1e3} for name in h}
+        for h, d in per_step
+    ]
+    with open(os.path.join(out_dir, "steps.json"), "w") as f:
+        json.dump({"components": per_step_ms,
+                   "partition": [{k: v / 1e3 for k, v in s.items()} for s in parts]}, f, indent=1)
+    mean_parts = {k: statistics.fmean(s[k] for s in parts) / 1e3 for k in PARTITION}
+    with open(os.path.join(out_dir, "partition.json"), "w") as f:
+        json.dump(mean_parts, f, indent=1)  # ms per step
+    print("step wall time split: " + ", ".join(f"{k} {v:.1f} ms" for k, v in mean_parts.items()))

@@ -91,6 +91,8 @@ engram_pad_id = 2 # <|_pad|> for DeepSeek-V3, as in the reference
 engram_hash_seed = 0
 engram_kernel_size = 4
 engram_table_device = '' # '' keeps the tables with the model; 'cpu' offloads them to host DRAM
+engram_table_pinned = False # offloaded tables: stage rows and their gradients in pinned, reused host buffers
+engram_table_weight_pinned = False # offloaded tables: keep the table itself in pinned memory
 # the pinned upstream implementation; relative to this file's directory
 engram_repo = str(Path(__file__).resolve().parent.parent / 'engram')
 engram_repo_sha = 'fb7f84a21f91223715394a33a1dc24bbfb7f788e'
@@ -116,8 +118,8 @@ compile = False # per-region torch.compile, see module docstring
 compile_mode = 'default' # torch.compile mode for the regions: 'default', 'reduce-overhead' (CUDA graphs), 'max-autotune'
 # profiling: per-component time of a gradient step -> out_dir/profile.md (see profiling.py)
 profile = False
-profile_warmup = 5 # steps skipped before the profiler starts recording
-profile_steps = 5 # steps recorded; the table is written when they are done
+profile_warmup = 20 # steps skipped before the profiler starts recording; host-side runs settle slowly
+profile_steps = 10 # steps recorded; the tables are written when they are done
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -251,6 +253,8 @@ def build_engram_config() -> EngramMemoryConfig | None:
         hash_seed=engram_hash_seed,
         kernel_size=engram_kernel_size,
         table_device=engram_table_device,
+        table_pinned=engram_table_pinned,
+        table_weight_pinned=engram_table_weight_pinned,
     )
 
 def build_hash_mapping_for_engram(engram_config: EngramMemoryConfig):

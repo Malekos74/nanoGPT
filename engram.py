@@ -44,8 +44,20 @@ class EngramMemoryConfig:
     # where the memory tables live: '' keeps them with the model, 'cpu' offloads
     # them to host DRAM (rows are gathered there and copied to the model's device)
     table_device: str = ''
+    # with offloaded tables, stage the rows and their gradients in pinned host
+    # buffers (allocated once, reused every step) so the copies run as DMA at
+    # bus speed instead of through the driver's pageable-memory bounce buffer
+    table_pinned: bool = False
+    # keep the offloaded table itself in pinned memory (its gradient and
+    # optimizer state stay pageable); nothing in the current pipeline DMAs
+    # from the table, so this is a measurement, not an expected speed-up
+    table_weight_pinned: bool = False
 
     def __post_init__(self):
+        if self.table_pinned and self.table_device != 'cpu':
+            raise ValueError("table_pinned needs table_device='cpu'")
+        if self.table_weight_pinned and self.table_device != 'cpu':
+            raise ValueError("table_weight_pinned needs table_device='cpu'")
         expected = self.max_ngram_size - 1
         if len(self.vocab_size_per_ngram) != expected:
             raise ValueError(
@@ -86,6 +98,51 @@ class ShortConv(nn.Module):
         y = self.conv(x_norm.transpose(1, 2))
         y = y[..., : x.size(1)]  # undo the look-ahead padding
         return self.act_fn(y).transpose(1, 2)
+
+
+class _PinnedStaging:
+    """Pinned host buffers for one Engram layer's row traffic, grown on demand
+    and reused every step. ``ready`` marks the end of the last upload, which
+    must finish before the row buffer is overwritten by the next gather."""
+
+    def __init__(self):
+        self.rows = torch.empty(0)
+        self.grads = torch.empty(0)
+        self.ready = torch.cuda.Event()
+
+    def take(self, which: str, n_rows: int, dim: int) -> torch.Tensor:
+        buf = getattr(self, which)
+        if buf.shape[0] < n_rows or buf.shape[1:] != (dim,):
+            buf = torch.empty((n_rows, dim), dtype=torch.float32, pin_memory=True)
+            setattr(self, which, buf)
+        return buf[:n_rows]
+
+
+class _PinnedLookup(torch.autograd.Function):
+    """Gather rows of a host table into pinned memory and upload them; in
+    backward, download the row gradients into pinned memory and scatter them
+    into a dense table gradient on the host."""
+
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, ids: torch.Tensor, device: torch.device,
+                staging: _PinnedStaging) -> torch.Tensor:
+        staging.ready.synchronize()
+        rows = torch.index_select(weight, 0, ids, out=staging.take("rows", ids.numel(), weight.shape[1]))
+        out = rows.to(device, non_blocking=True)
+        staging.ready.record()
+        ctx.save_for_backward(ids)
+        ctx.staging, ctx.table_shape = staging, weight.shape
+        return out
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        (ids,) = ctx.saved_tensors
+        host_grad = ctx.staging.take("grads", ids.numel(), grad.shape[1])
+        host_grad.copy_(grad, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        with record_function("bwd/table_grad"):
+            table_grad = torch.zeros(ctx.table_shape, dtype=host_grad.dtype).index_add_(0, ids, host_grad)
+        return table_grad, None, None, None
 
 
 class EngramMemory(nn.Module):
@@ -155,7 +212,12 @@ class EngramMemory(nn.Module):
 
     def _fetch(self, hash_ids: torch.Tensor) -> torch.Tensor:
         table = self.multi_head_embedding.weight.device
-        rows = self.multi_head_embedding(hash_ids.to(table) + self.table_offsets)
+        ids = hash_ids.to(table) + self.table_offsets
+        if self.config.table_pinned:
+            rows = _PinnedLookup.apply(self.multi_head_embedding.weight, ids.flatten(),
+                                       hash_ids.device, self._staging)
+            return rows.view(*ids.shape, -1).flatten(start_dim=-2)
+        rows = self.multi_head_embedding(ids)
         # with offloaded tables this is the host-to-device copy of the rows; the
         # gradient takes the reverse path through autograd
         return rows.to(hash_ids.device).flatten(start_dim=-2)
@@ -166,6 +228,11 @@ class EngramMemory(nn.Module):
         if self.config.table_device:
             self.multi_head_embedding.to(self.config.table_device)
             self.table_offsets = self.table_offsets.to(self.config.table_device)
+        if self.config.table_pinned:
+            self._staging = _PinnedStaging()
+        if self.config.table_weight_pinned:
+            weight = self.multi_head_embedding.weight
+            weight.data = weight.data.pin_memory()
 
     def _gate(self, embeddings: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         # one gate over the whole stream, replacing upstream's per-slice
