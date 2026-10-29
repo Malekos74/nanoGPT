@@ -92,8 +92,13 @@ LAUNCH_CALLS = ("cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel", "cu
 # the transfer, so it counts as communication, not host work)
 WAIT_CALLS = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize",
               "cudaMemcpy", "cudaMemcpyAsync")
-# the exclusive split of a step's wall time, see ``partition_step``
-PARTITION = ("gpu", "copy", "host", "launch", "data", "host_copy", "idle")
+# the exclusive split of a step's wall time, see ``partition_steps``; the
+# host-only part is split by the host range the work falls in
+HOST_PARTS = {"engram/fetch": "host/fetch", "bwd/table_grad": "host/table_grad",
+              "optimizer/clip": "host/clip", "optimizer/tables": "host/adam",
+              "optimizer/zero_grad": "host/release"}
+PARTITION = ("gpu", "copy", *HOST_PARTS.values(), "host/other", "launch", "data", "host_copy",
+             "idle")
 # a kernel launch normally returns in a few microseconds; one that takes this
 # many times the typical duration was blocked on a full launch queue, i.e. the
 # host was waiting for the GPU, not working
@@ -296,28 +301,34 @@ def project_host_time(intervals: list) -> dict:
     return host_us
 
 
-def _host_work_intervals(events: list, steps: list[Interval], typical_launch: float) -> list[Interval]:
-    """When at least one host thread is doing work: the step's own labelled ranges
-    (not ``backward``, in which the calling thread only waits for the autograd
-    thread, whose work the cpu ops cover) and every cpu op, minus the calls in
-    which a thread is blocked on the device."""
-    work, waits = [], []
+def _host_work_intervals(
+    events: list, steps: list[Interval], typical_launch: float
+) -> list[Interval]:
+    """When at least one host thread is doing useful work. Per thread: the step's
+    own labelled ranges (not ``backward``, in which the calling thread only waits
+    for the autograd thread, whose work the cpu ops cover) and every cpu op,
+    minus that thread's own blocking calls on the device; then the union over
+    threads, so that one thread's wait never hides another thread's work."""
+    work, waits = defaultdict(list), defaultdict(list)
     for e in events:
         if "ts" not in e or "dur" not in e:
             continue
         iv = (e["ts"], e["ts"] + e["dur"])
-        cat, name = e.get("cat"), e["name"]
+        cat, name, tid = e.get("cat"), e["name"], e["tid"]
         if cat == "user_annotation" and name in ("step/sync",):
-            waits.append(iv)
+            waits[tid].append(iv)
         elif cat == "cpu_op" or (cat == "user_annotation" and name not in ("step", "backward")
                                  and not name.startswith("ProfilerStep")):
-            work.append(iv)
+            work[tid].append(iv)
         elif cat in ("cuda_runtime", "cuda_driver") and name in WAIT_CALLS:
-            waits.append(iv)
+            waits[tid].append(iv)
         elif cat in ("cuda_runtime", "cuda_driver") and name in LAUNCH_CALLS \
                 and e["dur"] > BLOCKED_LAUNCH_FACTOR * typical_launch:
-            waits.append((iv[0] + typical_launch, iv[1]))
-    return _subtract(_merge(_clip(work, steps)), _merge(waits))
+            waits[tid].append((iv[0] + typical_launch, iv[1]))
+    useful = []
+    for tid, iv in work.items():
+        useful += _subtract(_merge(_clip(iv, steps)), _merge(waits[tid]))
+    return _merge(useful)
 
 
 def _part(active: tuple, in_data: bool) -> str:
@@ -344,13 +355,14 @@ def step_windows(events: list) -> list[Interval]:
 def partition_steps(events: list, steps: list[Interval]) -> list[dict[str, float]]:
     """Split each step's wall time into exclusive parts, in microseconds, one
     dict per step: ``gpu`` (a kernel runs, the host waits), ``copy`` (a memcpy
-    runs, nothing else), ``host`` (a host thread works, the device is idle),
+    runs, nothing else), ``host/*`` (a host thread works, the device is idle,
+    split by the range the work is in: ``HOST_PARTS``, else ``host/other``),
     ``launch`` (the host works while the GPU computes: it is ahead, launching
     kernels and the glue around them), ``data`` (the batch is loaded while the
     device is busy), ``host_copy`` (the host works while only a transfer is in
     flight) and ``idle`` (nothing runs)."""
-    launches = sorted(e["dur"] for e in events
-                      if e.get("cat") in ("cuda_runtime", "cuda_driver") and e["name"] in LAUNCH_CALLS)
+    launches = sorted(e["dur"] for e in events if e.get("cat") in ("cuda_runtime", "cuda_driver")
+                      and e["name"] in LAUNCH_CALLS)
     typical = launches[len(launches) // 2] if launches else 0.0
     lanes = {
         "gpu": _merge(_clip([(e["ts"], e["ts"] + e["dur"]) for e in events
@@ -361,16 +373,29 @@ def partition_steps(events: list, steps: list[Interval]) -> list[dict[str, float
     }
     data = _merge([(e["ts"], e["ts"] + e["dur"]) for e in events
                    if e.get("cat") == "user_annotation" and e["name"] == "step/data"])
+    named = {name: [] for name in HOST_PARTS}
+    for e in events:
+        cat = e.get("cat")
+        if cat == "user_annotation":
+            name = e["name"]
+        else:
+            name = NODE_RANGES.get(e["name"]) if cat == "cpu_op" else None
+        if name in named:
+            named[name].append((e["ts"], e["ts"] + e["dur"]))
+    named = {name: _merge(iv) for name, iv in named.items()}
     per_step = []
     for ws, we in steps:
         totals = dict.fromkeys(PARTITION, 0.0)
-        points = sorted({ws, we} | {p for iv in [*lanes.values(), data] for s, e in iv
-                                    for p in (s, e) if ws < p < we})
+        points = sorted({ws, we} | {p for iv in [*lanes.values(), data, *named.values()]
+                                    for s, e in iv for p in (s, e) if ws < p < we})
         for lo, hi in zip(points, points[1:], strict=False):
             active = tuple(lane for lane, iv in lanes.items()
                            if any(s <= lo and hi <= e for s, e in iv))
-            in_data = any(s <= lo and hi <= e for s, e in data)
-            totals[_part(active, in_data)] += hi - lo
+            key = _part(active, any(s <= lo and hi <= e for s, e in data))
+            if key == "host":
+                key = next((part for name, part in HOST_PARTS.items()
+                            if any(s <= lo and hi <= e for s, e in named[name])), "host/other")
+            totals[key] += hi - lo
         per_step.append(totals)
     return per_step
 
@@ -390,7 +415,8 @@ def events_in_step(events: list, window: Interval) -> list:
     inside = [e for e in events if "ts" in e and e.get("cat") not in DEVICE_CATEGORIES
               and ws <= e["ts"] < we]
     correlations = {e["args"]["correlation"] for e in inside
-                    if e.get("cat") in ("cuda_runtime", "cuda_driver") and "correlation" in e.get("args", {})}
+                    if e.get("cat") in ("cuda_runtime", "cuda_driver")
+                    and "correlation" in e.get("args", {})}
     device = [e for e in events if e.get("cat") in DEVICE_CATEGORIES
               and e.get("args", {}).get("correlation") in correlations]
     return inside + device
