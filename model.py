@@ -30,10 +30,14 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        print(config.n_embd, config.n_head)
         assert config.n_embd % config.n_head == 0
+        # grouped-query attention when n_kv_head < n_head (Llama/Qwen); None is GPT-2's multi-head
+        self.n_kv_head = config.n_head if config.n_kv_head is None else config.n_kv_head
+        if config.n_head % self.n_kv_head != 0:
+            raise ValueError(f"n_head {config.n_head} is not a multiple of n_kv_head {self.n_kv_head}")
+        self.head_dim = config.n_embd // config.n_head
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * self.n_kv_head * self.head_dim, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -49,20 +53,24 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+            if self.n_kv_head != self.n_head:
+                raise ValueError("grouped-query attention needs scaled_dot_product_attention (PyTorch >= 2.5)")
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        kv_width = self.n_kv_head * self.head_dim
+        q, k, v  = self.c_attn(x).split([self.n_embd, kv_width, kv_width], dim=2)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2) # (B, nkv, T, hs)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2) # (B, nkv, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True,
+                                                                 enable_gqa=self.n_kv_head != self.n_head)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -77,17 +85,27 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
+    """GPT-2's GELU MLP, or (``mlp='swiglu'``) Llama/Qwen's SwiGLU, whose gate and up
+    projections are one fused ``c_fc`` of twice the inner width."""
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        if config.mlp not in ('gelu', 'swiglu'):
+            raise ValueError(f"mlp must be 'gelu' or 'swiglu', got {config.mlp!r}")
+        self.swiglu = config.mlp == 'swiglu'
+        hidden = 4 * config.n_embd if config.mlp_hidden is None else config.mlp_hidden
+        self.c_fc    = nn.Linear(config.n_embd, (2 if self.swiglu else 1) * hidden, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(hidden, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        if self.swiglu:
+            gate, up = x.chunk(2, dim=-1)
+            x = F.silu(gate) * up
+        else:
+            x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -115,6 +133,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    n_kv_head: int | None = None # key/value heads; fewer than n_head is grouped-query attention. None: n_head, as in GPT-2
+    mlp: str = 'gelu' # 'gelu' (GPT-2) or 'swiglu' (Llama/Qwen)
+    mlp_hidden: int | None = None # MLP inner width. None: GPT-2's 4 * n_embd
 
 class GPT(nn.Module):
 

@@ -12,9 +12,13 @@ Same shape as ``train.py`` (single GPU debug mode, or DDP via
 To run on a single GPU, example:
 $ python train_engram.py --batch_size=32 --compile=False
 
-``compile`` compiles the model per region (the embedding, each
-block, the head and each Engram sub-step) through
-``model_engram.compile_regions``, so the profiler labels and the
+``compile`` compiles the model per region through
+``model_engram.compile_regions``: the backbone's segments between
+the Engram injection layers ([embedding + blocks before the first],
+..., [blocks from the last + head + loss], the same cuts with Engram
+disabled) and each Engram module's [compress + hash] and [mix], with
+the row fetch between them eager, as is Liger's fused head and loss
+(``fused_cross_entropy``). The profiler labels and the
 backward markers between the regions stay in eager Python and the
 per-component table survives; whole-model torch.compile would
 drop them.
@@ -29,6 +33,7 @@ such corpora) and point ``dataset`` at it.
 """
 
 import os
+import json
 import time
 import math
 import pickle
@@ -51,6 +56,7 @@ from efficient_engram.reference import build_hash_mapping
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out-engram'
+eval_enabled = True # False: no evaluation and no checkpoints, training steps only (profiling)
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -78,6 +84,13 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# None keeps GPT-2's choice; a config file can set them (the CLI cannot override a None)
+n_kv_head = None # key/value heads, fewer than n_head is grouped-query attention; None: n_head
+mlp = 'gelu' # 'gelu' (GPT-2) or 'swiglu' (Llama/Qwen)
+mlp_hidden = None # MLP inner width; None: 4 * n_embd
+activation_checkpointing = False # recompute every block and Engram module in backward
+engram_checkpoint = 'full' # with activation_checkpointing: 'full' recomputes the Engram module with its row fetch, 'after_fetch' keeps the fetched rows (one fetch per step; needed by the pinned table paths)
+fused_cross_entropy = False # training loss through Liger's fused linear cross-entropy, never materializing the logits
 # engram memory (None disables it; see configs/trace_table_access.yml
 # for the Engram-27B geometry these mirror)
 engram_enabled = True
@@ -93,6 +106,12 @@ engram_kernel_size = 4
 engram_table_device = '' # '' keeps the tables with the model; 'cpu' offloads them to host DRAM
 engram_table_pinned = False # offloaded tables: stage rows and their gradients in pinned, reused host buffers
 engram_table_weight_pinned = False # offloaded tables: keep the table itself in pinned memory
+engram_table_dedup = False # look up (and, offloaded, copy) each distinct row of a step once; counts go to out_dir/dedup.json when profiling
+engram_table_grad_reuse = False # pinned tables: keep the dense table gradient alive across steps instead of allocating and freeing it every step
+engram_table_prefetch = False # pinned tables: hash, dedup and copy the step's row ids to the host on a side stream before the backbone starts, and upload the rows on it, so the gather and the copy overlap the blocks before the layer
+engram_table_optimizer = 'adamw' # 'adamw', or 'momentum': Nesterov momentum only, V4.1-Flash's one state buffer (without its Sinkhorn balancing)
+engram_table_async_backward = False # reused gradient: scatter the row gradients into it on the thread that called backward(), beside autograd's CUDA thread, which goes on with the backbone's backward meanwhile
+engram_table_row_clip = False # pinned, deduplicated tables: clip the table through the norm of its row gradients, taken on the GPU before they come down, with the clip coefficient folded into the table optimizer's fused kernel; the dense table gradient is never normed or scaled on the host (needs grad_clip > 0 and no gradient accumulation)
 # the pinned upstream implementation; relative to this file's directory
 engram_repo = str(Path(__file__).resolve().parent.parent / 'engram')
 engram_repo_sha = 'fb7f84a21f91223715394a33a1dc24bbfb7f788e'
@@ -203,6 +222,9 @@ if corpus_dir:
         y = torch.from_numpy(block[1:]).view(batch_size, block_size)
         return to_device(x, y)
 
+if eval_only and not eval_enabled:
+    raise ValueError("eval_only=True needs eval_enabled=True")
+
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
@@ -255,6 +277,11 @@ def build_engram_config() -> EngramMemoryConfig | None:
         table_device=engram_table_device,
         table_pinned=engram_table_pinned,
         table_weight_pinned=engram_table_weight_pinned,
+        table_dedup=engram_table_dedup,
+        table_grad_reuse=engram_table_grad_reuse,
+        table_prefetch=engram_table_prefetch,
+        table_async_backward=engram_table_async_backward,
+        table_row_clip=engram_table_row_clip,
     )
 
 def build_hash_mapping_for_engram(engram_config: EngramMemoryConfig):
@@ -277,6 +304,11 @@ def build_hash_mapping_for_engram(engram_config: EngramMemoryConfig):
     )
 
 engram_config = build_engram_config()
+if engram_config is not None and engram_config.table_row_clip:
+    if gradient_accumulation_steps != 1:
+        raise ValueError(f"engram_table_row_clip needs gradient_accumulation_steps=1, got {gradient_accumulation_steps}")
+    if grad_clip == 0.0:
+        raise ValueError("engram_table_row_clip needs grad_clip > 0")
 engram_mapping = None
 if engram_config is not None:
     print(f"building Engram memory on layers {engram_config.layer_ids}")
@@ -299,6 +331,12 @@ if engram_config is not None:
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
+                  n_kv_head=n_kv_head, mlp=mlp, mlp_hidden=mlp_hidden,
+                  activation_checkpointing=activation_checkpointing, engram_checkpoint=engram_checkpoint,
+                  fused_cross_entropy=fused_cross_entropy,
+                  # the backbone's compile regions are cut at the injection layers,
+                  # with Engram disabled too, so that both setups compile the same graphs
+                  segment_cuts=engram_layer_ids,
                   engram=asdict(engram_config) if engram_config is not None else None) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -317,7 +355,8 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'engram']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'engram',
+              'n_kv_head', 'mlp', 'mlp_hidden', 'segment_cuts']:
         model_args[k] = checkpoint_model_args[k]
     # rebuild the mapping before the model: the checkpoint's engram
     # section travels with model_args, and GPTWithEngram needs it
@@ -353,7 +392,8 @@ model.place_tables() # offloaded tables go back to their device
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizers = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, muon_momentum)
+optimizers = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, muon_momentum,
+                                        table_optimizer=engram_table_optimizer)
 if init_from == 'resume':
     for name, opt in optimizers.items():
         opt.load_state_dict(checkpoint['optimizers'][name])
@@ -409,8 +449,10 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-profiler = build_profiler(out_dir, profile_warmup, profile_steps) if profile and master_process else nullcontext()
+profiler = build_profiler(out_dir=out_dir, warmup_steps=profile_warmup, active_steps=profile_steps,
+                          tokens_per_step=tokens_per_iter) if profile and master_process else nullcontext()
 profiler.__enter__()
+dedup_steps = [] # per step, {layer_id: {"lookups", "unique"}}: how much the step's row ids deduplicated
 while True:
 
     # determine and set the learning rate for this iteration
@@ -420,7 +462,7 @@ while True:
             param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if eval_enabled and iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -473,7 +515,8 @@ while True:
             if grad_clip != 0.0:
                 for opt in optimizers.values():
                     scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                raw_model.clip_grad_norm_(max_norm=grad_clip,
+                                          table_optimizer=optimizers["tables"] if "tables" in optimizers else None)
         # step the optimizers and the scaler if training in fp16
         for name, opt in optimizers.items():
             # muon and adamw together are the backbone's update; the tables are their own row
@@ -494,6 +537,9 @@ while True:
     step_span.__exit__(None, None, None)
     if profile and master_process:
         profiler.step()
+    if engram_table_dedup and master_process:
+        dedup_steps.append({layer_id: dict(zip(("lookups", "unique"), module.last_dedup))
+                            for layer_id, module in raw_model.engram_layers.items()})
 
     # timing and logging
     t1 = time.time()
@@ -506,7 +552,9 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        mem = (f", peak mem {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB allocated, "
+               f"{torch.cuda.max_memory_reserved() / 2**30:.1f} GiB reserved") if device_type == 'cuda' else ''
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%{mem}")
     iter_num += 1
     local_iter_num += 1
 
@@ -515,5 +563,12 @@ while True:
         break
 
 profiler.__exit__(None, None, None)
+if profile and master_process and engram_table_dedup:
+    with open(os.path.join(out_dir, 'dedup.json'), 'w') as f:
+        json.dump({'profile_warmup': profile_warmup, 'profile_steps': profile_steps, 'steps': dedup_steps}, f, indent=1)
+    for layer_id in dedup_steps[0]:
+        ratios = [s[layer_id]['lookups'] / s[layer_id]['unique'] for s in dedup_steps]
+        print(f"dedup, layer {layer_id}: {dedup_steps[0][layer_id]['lookups']:,} lookups per step, "
+              f"{min(ratios):.2f}-{max(ratios):.2f} lookups per distinct row")
 if ddp:
     destroy_process_group()

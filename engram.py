@@ -18,6 +18,7 @@ Run as part of ``train_engram.py``; see that file for the config plumbing.
 """
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -26,6 +27,15 @@ from torch.profiler import record_function
 
 from efficient_engram.hashing.ngram_hash_torch import NgramHasher
 from model import LayerNorm
+
+
+def _forward_range(name: str):
+    """``record_function(name)``, except while autograd recomputes a
+    checkpointed forward in backward: that time belongs to the ``bwd/*`` range
+    it runs in, not to the forward row of the same name."""
+    if torch._C._current_graph_task_id() != -1:
+        return nullcontext()
+    return record_function(name)
 
 
 @dataclass
@@ -52,10 +62,55 @@ class EngramMemoryConfig:
     # optimizer state stay pageable); nothing in the current pipeline DMAs
     # from the table, so this is a measurement, not an expected speed-up
     table_weight_pinned: bool = False
+    # look up each distinct row of the step once: the flat row ids are uniqued
+    # on the model's device, only the distinct rows are gathered (and, with
+    # offloaded tables, copied) and the inverse map expands them per token;
+    # the row gradients are summed per distinct row on the device before they
+    # reach the table. Works for any table placement; the step's counts are
+    # kept in ``EngramMemory.last_dedup``
+    table_dedup: bool = False
+    # with pinned staging, keep one dense table gradient per layer alive across
+    # steps: backward adds the row gradients into it (after clearing the rows
+    # the previous step wrote) and attaches it as the weight's .grad, instead
+    # of autograd allocating, zero-filling and freeing a table-sized tensor
+    # every step
+    table_grad_reuse: bool = False
+    # with pinned staging, address the step before the backbone starts
+    # (``EngramMemory.prefetch``, called at the top of the model's forward):
+    # compress, hash and dedup run on a side CUDA stream and the row ids are
+    # copied to the host there, so that when the forward reaches the layer the
+    # gather starts at once instead of waiting behind the preceding blocks'
+    # kernels; the rows go up on the same side stream and overlap whatever the
+    # backbone is still computing. All within the step, so nothing is stale.
+    table_prefetch: bool = False
+    # with a reused gradient, run the table's backward beside autograd's CUDA
+    # thread instead of on it: the lookup is split into a host half (gather,
+    # scatter) and a device half (upload, download), and the download's result
+    # is a CPU tensor, which makes autograd run the scatter on the thread that
+    # called backward() while its CUDA thread goes on with the backbone's
+    # remaining blocks. backward() returns once both are done
+    table_async_backward: bool = False
+    # with pinned, deduplicated tables, clip the table through its rows: the
+    # norm of the row gradients, which is the dense gradient's norm since every
+    # other row is zero, is taken on the device before the rows come down and
+    # enters the global norm there, and the clip coefficient reaches the table
+    # through its optimizer's fused kernel, which scales the gradient as it
+    # reads it (``GPTWithEngram.clip_grad_norm_``). The dense table gradient is
+    # never normed or scaled on the host. One backward per step: a norm is one
+    # backward's, so the table gradient cannot accumulate across backwards
+    table_row_clip: bool = False
 
     def __post_init__(self):
         if self.table_pinned and self.table_device != 'cpu':
             raise ValueError("table_pinned needs table_device='cpu'")
+        if self.table_grad_reuse and not self.table_pinned:
+            raise ValueError("table_grad_reuse needs table_pinned=True")
+        if self.table_prefetch and not self.table_pinned:
+            raise ValueError("table_prefetch needs table_pinned=True")
+        if self.table_async_backward and not self.table_grad_reuse:
+            raise ValueError("table_async_backward needs table_grad_reuse=True")
+        if self.table_row_clip and not (self.table_pinned and self.table_dedup):
+            raise ValueError("table_row_clip needs table_pinned=True and table_dedup=True")
         if self.table_weight_pinned and self.table_device != 'cpu':
             raise ValueError("table_weight_pinned needs table_device='cpu'")
         expected = self.max_ngram_size - 1
@@ -101,48 +156,165 @@ class ShortConv(nn.Module):
 
 
 class _PinnedStaging:
-    """Pinned host buffers for one Engram layer's row traffic, grown on demand
-    and reused every step. ``ready`` marks the end of the last upload, which
-    must finish before the row buffer is overwritten by the next gather."""
+    """Pinned host buffers for one Engram layer's row traffic, allocated once at
+    ``capacity`` rows (the batch's lookups, which a deduplicated step never
+    exceeds) and reused every step. ``ready`` marks the end of the last upload,
+    which must finish before the row buffer is overwritten by the next gather;
+    ``landed`` the end of the last download, which the scatter waits for.
+    A prefetching layer (``table_prefetch``) also owns a side ``stream``: its
+    addressing and the copy of its row ids to the host run there ahead of the
+    backbone (``ids_ready`` marks the copy's end), and so does the upload."""
 
-    def __init__(self):
+    def __init__(self, stream: torch.cuda.Stream | None, row_clip: bool):
+        self.stream = stream
+        # table_row_clip: the norm of the last backward's row gradients, a 0-dim
+        # device tensor, until the clip takes it
+        self.row_clip = row_clip
+        self.grad_norm: torch.Tensor | None = None
         self.rows = torch.empty(0)
         self.grads = torch.empty(0)
         self.ready = torch.cuda.Event()
+        self.ids_ready = torch.cuda.Event()
+        self.landed = torch.cuda.Event()
+        # the persistent dense table gradient (table_grad_reuse) and the rows
+        # written into it since it was last cleared
+        self.table_grad = torch.empty(0)
+        self.touched = torch.empty(0, dtype=torch.long)
 
-    def take(self, which: str, n_rows: int, dim: int) -> torch.Tensor:
+    def take(self, which: str, n_rows: int, capacity: int, dim: int) -> torch.Tensor:
+        if n_rows > capacity:
+            raise ValueError(f"{n_rows} rows asked of a {capacity}-row staging buffer")
         buf = getattr(self, which)
-        if buf.shape[0] < n_rows or buf.shape[1:] != (dim,):
-            buf = torch.empty((n_rows, dim), dtype=torch.float32, pin_memory=True)
+        if buf.shape[0] < capacity or buf.shape[1:] != (dim,):
+            buf = torch.empty((capacity, dim), dtype=torch.float32, pin_memory=True)
             setattr(self, which, buf)
         return buf[:n_rows]
+
+    def gather(self, weight: torch.Tensor, ids: torch.Tensor, capacity: int) -> torch.Tensor:
+        """Rows ``ids`` of the host table ``weight``, in the pinned row buffer."""
+        self.ready.synchronize()
+        out = self.take("rows", ids.numel(), capacity, weight.shape[1])
+        return torch.index_select(weight, 0, ids, out=out)
+
+    def upload(self, rows: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """``rows`` (a slice of the pinned row buffer) on ``device``: one DMA,
+        marked by ``ready``. On the side stream when there is one, so that it
+        overlaps the backbone's kernels on the current stream, which then waits
+        for it; the rows' memory is tied to the current stream, their consumer."""
+        if self.stream is None:
+            out = rows.to(device, non_blocking=True)
+            self.ready.record()
+            return out
+        current = torch.cuda.current_stream(device)
+        with torch.cuda.stream(self.stream):
+            out = rows.to(device, non_blocking=True)
+            self.ready.record()
+        current.wait_event(self.ready)
+        out.record_stream(current)
+        return out
+
+    def download(self, grad: torch.Tensor, capacity: int) -> torch.Tensor:
+        """The row gradients ``grad`` copied from the device into the pinned
+        gradient buffer, on the current stream; ``landed`` marks the copy's end."""
+        host_grad = self.take("grads", grad.shape[0], capacity, grad.shape[1])
+        if self.row_clip:
+            self.grad_norm = torch.linalg.vector_norm(grad)
+        host_grad.copy_(grad, non_blocking=True)
+        self.landed.record()
+        return host_grad
+
+    def scatter(self, weight: torch.Tensor, ids: torch.Tensor, rows: torch.Tensor,
+                reuse: bool) -> torch.Tensor | None:
+        """The row gradients ``rows`` of ``ids`` into a dense table gradient on
+        the host, once they have landed: with ``reuse`` the persistent one,
+        attached to the weight (returns None), else a fresh one for autograd."""
+        self.landed.synchronize()
+        with record_function("bwd/table_grad"):
+            if reuse:
+                self.accumulate(weight, ids, rows)
+                return None
+            return torch.zeros(weight.shape, dtype=rows.dtype).index_add_(0, ids, rows)
+
+    def accumulate(self, weight: torch.Tensor, ids: torch.Tensor, rows: torch.Tensor) -> None:
+        """Add the row gradients ``rows`` of ``ids`` into the persistent dense
+        table gradient and attach it as ``weight.grad``. A new accumulation
+        window (``weight.grad`` is None, i.e. zero_grad ran since the last
+        backward) first clears the rows the previous window wrote; every other
+        row is still zero from before."""
+        if self.table_grad.shape != weight.shape:
+            self.table_grad = torch.zeros(weight.shape, dtype=rows.dtype)
+        if weight.grad is None:
+            self.table_grad.index_fill_(0, self.touched, 0.0)
+            self.touched = ids
+        elif weight.grad is not self.table_grad:
+            raise RuntimeError("table_grad_reuse: the weight's grad is not the reused buffer")
+        else:
+            if self.row_clip:
+                raise RuntimeError("table_row_clip: the table gradient cannot accumulate across backwards")
+            self.touched = torch.cat([self.touched, ids])
+        self.table_grad.index_add_(0, ids, rows)
+        weight.grad = self.table_grad
 
 
 class _PinnedLookup(torch.autograd.Function):
     """Gather rows of a host table into pinned memory and upload them; in
     backward, download the row gradients into pinned memory and scatter them
-    into a dense table gradient on the host."""
+    into a dense table gradient on the host: a fresh one returned to autograd,
+    or with ``reuse`` the staging's persistent one, attached to the weight
+    directly (autograd then gets no gradient for the weight). All of the
+    backward runs on autograd's CUDA thread, which waits for the download."""
 
     @staticmethod
     def forward(ctx, weight: torch.Tensor, ids: torch.Tensor, device: torch.device,
-                staging: _PinnedStaging) -> torch.Tensor:
-        staging.ready.synchronize()
-        rows = torch.index_select(weight, 0, ids, out=staging.take("rows", ids.numel(), weight.shape[1]))
-        out = rows.to(device, non_blocking=True)
-        staging.ready.record()
-        ctx.save_for_backward(ids)
-        ctx.staging, ctx.table_shape = staging, weight.shape
+                staging: _PinnedStaging, capacity: int, reuse: bool) -> torch.Tensor:
+        out = staging.upload(staging.gather(weight, ids, capacity), device)
+        ctx.save_for_backward(ids, weight)
+        ctx.staging, ctx.capacity, ctx.reuse = staging, capacity, reuse
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        (ids,) = ctx.saved_tensors
-        host_grad = ctx.staging.take("grads", ids.numel(), grad.shape[1])
-        host_grad.copy_(grad, non_blocking=True)
-        torch.cuda.current_stream().synchronize()
-        with record_function("bwd/table_grad"):
-            table_grad = torch.zeros(ctx.table_shape, dtype=host_grad.dtype).index_add_(0, ids, host_grad)
-        return table_grad, None, None, None
+        ids, weight = ctx.saved_tensors
+        host_grad = ctx.staging.download(grad, ctx.capacity)
+        table_grad = ctx.staging.scatter(weight, ids, host_grad, ctx.reuse)
+        return table_grad, None, None, None, None, None
+
+
+class _HostGather(torch.autograd.Function):
+    """The host half of a lookup with ``table_async_backward``: the gather in
+    forward, the scatter in backward. Its backward's input is the CPU tensor
+    that ``_Upload``'s backward returns, and autograd runs a node whose input
+    gradient is on the CPU on the thread that called backward(), so the scatter
+    runs there, beside the CUDA thread's remaining backbone nodes, after waiting
+    for the download to land. backward() returns once both threads are done."""
+
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, ids: torch.Tensor, staging: _PinnedStaging,
+                capacity: int, reuse: bool) -> torch.Tensor:
+        ctx.save_for_backward(ids, weight)
+        ctx.staging, ctx.reuse = staging, reuse
+        return staging.gather(weight, ids, capacity)
+
+    @staticmethod
+    def backward(ctx, host_grad: torch.Tensor):
+        ids, weight = ctx.saved_tensors
+        table_grad = ctx.staging.scatter(weight, ids, host_grad, ctx.reuse)
+        return table_grad, None, None, None, None
+
+
+class _Upload(torch.autograd.Function):
+    """The device half: the upload in forward, the download in backward, which
+    autograd's CUDA thread issues without waiting for it (``_HostGather`` does)."""
+
+    @staticmethod
+    def forward(ctx, rows: torch.Tensor, device: torch.device, staging: _PinnedStaging,
+                capacity: int) -> torch.Tensor:
+        ctx.staging, ctx.capacity = staging, capacity
+        return staging.upload(rows, device)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return ctx.staging.download(grad, ctx.capacity), None, None, None
 
 
 class EngramMemory(nn.Module):
@@ -166,6 +338,9 @@ class EngramMemory(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
+        # between ``prefetch`` and the ``forward`` that consumes it: the step's
+        # row ids (in the pinned ``ids`` buffer) and its dedup inverse map
+        self._prefetched: tuple[torch.Tensor, torch.Tensor | None] | None = None
 
         # a submodule, so its constants move with the model and the whole
         # compress -> hash -> gather chain runs on the table's device
@@ -204,32 +379,71 @@ class EngramMemory(nn.Module):
             dilation=config.max_ngram_size,
         )
 
-    # The sub-steps are methods so that ``compile_regions`` can compile each
-    # one on its own; the profiler labels in ``forward`` stay in eager Python
-    # (torch.compile drops record_function ranges inside a compiled graph).
-    def _compress(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.lookup_table[input_ids.to(self.lookup_table.device)]
+    # The two compile regions, [compress + hash] and [mix], are methods so that
+    # ``compile_regions`` can compile each on its own; the row fetch between
+    # them and the profiler labels stay in eager Python (torch.compile drops
+    # record_function ranges inside a compiled graph).
+    def _address(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Raw ``[B, T]`` ids -> ``[B*T*H]`` flat row ids, token-major: the
+        tokenizer compression, the n-gram hash and the per-head table offsets."""
+        compressed = self.lookup_table[input_ids.to(self.lookup_table.device)]
+        return (self.hasher(compressed) + self.table_offsets).flatten()
 
-    def _fetch(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        table = self.multi_head_embedding.weight.device
-        ids = hash_ids.to(table) + self.table_offsets
+    def _dedup(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The distinct row ids of the step (sorted) and, per lookup, its position
+        among them. A sort on the device; the count comes back to the host."""
+        unique_ids, inverse = torch.unique(ids, return_inverse=True)
+        self.last_dedup = (ids.numel(), unique_ids.numel())
+        return unique_ids, inverse
+
+    def _address_step(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The step's flat row ids and, with ``table_dedup``, the distinct ids
+        instead with the inverse map placing them per lookup (else ``None``)."""
+        with _forward_range("engram/address"):
+            ids = self._address(input_ids)
+        if not self.config.table_dedup:
+            return ids, None
+        with _forward_range("engram/dedup"):
+            return self._dedup(ids)
+
+    def _lookup(self, ids: torch.Tensor, capacity: int) -> torch.Tensor:
+        """Rows ``ids`` of the table, as ``[len(ids), dim]`` on the model's device.
+        ``capacity`` is the most rows a step can ask for, the pinned buffers' size."""
+        weight = self.multi_head_embedding.weight
+        device = self.table_offsets.device
         if self.config.table_pinned:
-            rows = _PinnedLookup.apply(self.multi_head_embedding.weight, ids.flatten(),
-                                       hash_ids.device, self._staging)
-            return rows.view(*ids.shape, -1).flatten(start_dim=-2)
-        rows = self.multi_head_embedding(ids)
+            # a prefetched step hands the ids over in the pinned host buffer
+            host_ids = ids if ids.device == weight.device else ids.to(weight.device)
+            staging, reuse = self._staging, self.config.table_grad_reuse
+            if self.config.table_async_backward:
+                rows = _HostGather.apply(weight, host_ids, staging, capacity, reuse)
+                return _Upload.apply(rows, device, staging, capacity)
+            return _PinnedLookup.apply(weight, host_ids, device, staging, capacity, reuse)
         # with offloaded tables this is the host-to-device copy of the rows; the
         # gradient takes the reverse path through autograd
-        return rows.to(hash_ids.device).flatten(start_dim=-2)
+        return self.multi_head_embedding(ids.to(weight.device)).to(device)
+
+    def _fetch(self, ids: torch.Tensor, inverse: torch.Tensor | None,
+               batch_shape: torch.Size) -> torch.Tensor:
+        """The embeddings ``[B, T, H*dim]`` of the flat row ids; with ``inverse``
+        (deduplicated step) ``ids`` are the distinct rows and ``inverse`` places
+        them per lookup, its backward summing the row gradients per distinct row."""
+        capacity = ids.numel() if inverse is None else inverse.numel()
+        rows = self._lookup(ids, capacity)
+        if inverse is not None:
+            rows = torch.index_select(rows, 0, inverse)
+        return rows.view(*batch_shape, -1)
 
     def place_table(self) -> None:
-        """Move the table (and its offsets) to ``config.table_device`` if one is
-        set; call after ``model.to(device)``, which moves everything together."""
+        """Move the table to ``config.table_device`` if one is set; call after
+        ``model.to(device)``, which moves everything together. The offsets stay
+        with the hasher: addressing happens on the model's device, and only the
+        flat row ids cross to the table."""
         if self.config.table_device:
             self.multi_head_embedding.to(self.config.table_device)
-            self.table_offsets = self.table_offsets.to(self.config.table_device)
         if self.config.table_pinned:
-            self._staging = _PinnedStaging()
+            stream = torch.cuda.Stream() if self.config.table_prefetch else None
+            self._staging = _PinnedStaging(stream=stream, row_clip=self.config.table_row_clip)
         if self.config.table_weight_pinned:
             weight = self.multi_head_embedding.weight
             weight.data = weight.data.pin_memory()
@@ -244,34 +458,84 @@ class EngramMemory(nn.Module):
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         return gate.sigmoid().unsqueeze(-1)
 
-    def _value(self, embeddings: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        return gate * self.value_proj(embeddings)
+    def _mix(self, embeddings: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Gate, value and short conv: everything after the fetch."""
+        value = self._gate(embeddings, hidden_states) * self.value_proj(embeddings)
+        return value + self.short_conv(value)
 
     def compile_regions(self, mode: str) -> None:
-        """torch.compile each sub-step separately, keeping the labels between them."""
-        self._compress = torch.compile(self._compress, mode=mode)
-        self.hasher.forward = torch.compile(self.hasher.forward, mode=mode)
-        if not self.config.table_device:  # a cross-device gather stays eager
-            self._fetch = torch.compile(self._fetch, mode=mode)
-        self._gate = torch.compile(self._gate, mode=mode)
-        self._value = torch.compile(self._value, mode=mode)
-        self.short_conv.forward = torch.compile(self.short_conv.forward, mode=mode)
+        """torch.compile [compress + hash] and [mix], each as one graph. The
+        fetch between them stays eager wherever the table lives, so that every
+        table placement compiles the same regions (an offloaded gather crosses
+        devices, a deduplicated one changes size every step)."""
+        self._address = torch.compile(self._address, mode=mode)
+        self._mix = torch.compile(self._mix, mode=mode)
+
+    def prefetch(self, input_ids: torch.Tensor) -> None:
+        """Address the step ahead of the layer (``table_prefetch``): compress,
+        hash, dedup and the copy of the row ids to pinned host memory, on the
+        staging's side stream so that none of it queues behind the backbone's
+        kernels. The next ``forward`` picks the result up and gathers at once.
+        The ids get a tensor of their own (from the caching pinned allocator,
+        so no cudaHostAlloc after the first step) rather than a reused buffer:
+        backward and the reused gradient's clear keep them past the next prefetch."""
+        if self._prefetched is not None:
+            raise RuntimeError(f"layer {self.layer_id}: prefetch called twice without a forward")
+        staging = self._staging
+        current = torch.cuda.current_stream(input_ids.device)
+        staging.stream.wait_stream(current)  # the batch's upload
+        input_ids.record_stream(staging.stream)
+        with torch.cuda.stream(staging.stream):
+            ids, inverse = self._address_step(input_ids)
+            if inverse is not None:
+                inverse.record_stream(current)  # consumed by the expand on the current stream
+            host_ids = torch.empty(ids.numel(), dtype=torch.long, pin_memory=True)
+            host_ids.copy_(ids, non_blocking=True)
+            staging.ids_ready.record()
+        self._prefetched = (host_ids, inverse)
+
+    def take_grad_norm(self) -> torch.Tensor:
+        """The norm of the table's gradient from the last backward (``table_row_clip``),
+        a 0-dim tensor on the model's device. Each backward's norm is taken once:
+        a clip without a backward since the last one raises."""
+        if not self.config.table_row_clip:
+            raise RuntimeError(f"layer {self.layer_id}: table_row_clip is off")
+        norm = self._staging.grad_norm
+        if norm is None:
+            raise RuntimeError(f"layer {self.layer_id}: no table gradient norm since the last clip")
+        self._staging.grad_norm = None
+        return norm
+
+    def _take_prefetched(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._prefetched is None:
+            raise RuntimeError(
+                f"layer {self.layer_id}: table_prefetch is on but the step was not prefetched"
+            )
+        ids, inverse = self._prefetched
+        self._prefetched = None
+        self._staging.ids_ready.synchronize()
+        return ids, inverse
+
+    def fetch(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """The step's embeddings ``[B, T, H*dim]`` on the model's device for raw
+        ``input_ids`` [B, T]: addressing and the row fetch, the only part of the
+        forward that touches the table."""
+        if self.config.table_prefetch:
+            ids, inverse = self._take_prefetched()
+        else:
+            ids, inverse = self._address_step(input_ids)  # [B*T*H] flat row ids
+        with _forward_range("engram/fetch"):
+            return self._fetch(ids, inverse, input_ids.shape)
+
+    def mix(self, embeddings: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Gate, value and short conv of fetched ``embeddings`` against
+        ``hidden_states`` [B, T, n_embd]: everything after the fetch."""
+        with _forward_range("engram/mix"):
+            return self._mix(embeddings, hidden_states)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor):
         """``hidden_states`` [B, T, n_embd], ``input_ids`` [B, T] raw ids."""
-        # the hasher consumes *compressed* ids
-        with record_function("engram/compress"):
-            compressed = self._compress(input_ids)
-        with record_function("engram/hash"):
-            hash_ids = self.hasher(compressed)  # [B, T, H]
-        with record_function("engram/fetch"):
-            embeddings = self._fetch(hash_ids)
-        with record_function("engram/gate"):
-            gate = self._gate(embeddings, hidden_states)
-        with record_function("engram/value"):
-            value = self._value(embeddings, gate)
-        with record_function("engram/short_conv"):  # the conv and its sum into the value
-            return value + self.short_conv(value)
+        return self.mix(embeddings=self.fetch(input_ids), hidden_states=hidden_states)
 
 
 def build_engram_layers(

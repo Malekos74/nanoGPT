@@ -33,10 +33,19 @@ onto the parent's window with each instant owned by one child (see
 and overlapped work is reported once, under the child listed first.
 ``bwd/engine start`` is the head of the backward, from the call until the
 engine's first node runs (see ``_add_engine_start``).
+
+``metrics.json`` holds the run-level numbers to compare setups by: tokens per
+second (the step's tokens over its wall time), GPU utilization (the share of
+the step's wall time in which a kernel or memset runs, the quantity
+nvidia-smi samples, here measured exactly from the trace), the peak CUDA
+memory of the run (allocated and reserved) and the host's resident memory at
+the end of the recorded steps.
 """
 
+import bisect
 import json
 import os
+import resource
 import statistics
 from collections import defaultdict
 
@@ -51,17 +60,14 @@ COMPONENTS = [
     "step/data",
     "fwd/backbone",
     "fwd/engram",
-    "engram/compress",
-    "engram/hash",
+    "engram/address",
+    "engram/dedup",
     "engram/fetch",
-    "engram/gate",
-    "engram/value",
-    "engram/short_conv",
+    "engram/mix",
     "engram/residual_add",
     "backward",
     "bwd/engine start",
     "bwd/backbone",
-    "bwd/embedding",
     "bwd/table_grad",
     "bwd/engram",
     "optimizer",
@@ -75,12 +81,12 @@ COMPONENTS = [
 PARENTS = {
     "step": ["step/sync", "step/launch wait", "step/data", "fwd/backbone", "fwd/engram",
              "backward", "optimizer"],
-    "fwd/engram": ["engram/compress", "engram/hash", "engram/fetch", "engram/gate",
-                   "engram/value", "engram/short_conv", "engram/residual_add"],
-    # table_grad before engram: the table's backward is counted in full, whether it
-    # runs on the calling thread beside the copy (eager) or inside bwd/engram (pinned)
-    "backward": ["bwd/engine start", "bwd/backbone", "bwd/embedding", "bwd/table_grad",
-                 "bwd/engram"],
+    "fwd/engram": ["engram/address", "engram/dedup", "engram/fetch", "engram/mix",
+                   "engram/residual_add"],
+    # table_grad first: the table's backward is counted in full, whether it runs
+    # on the calling thread beside the copy (eager), inside bwd/engram (pinned)
+    # or on its own thread under the backbone's backward (async)
+    "backward": ["bwd/table_grad", "bwd/engine start", "bwd/backbone", "bwd/engram"],
     "optimizer": ["optimizer/clip", "optimizer/backbone", "optimizer/tables",
                   "optimizer/zero_grad"],
 }
@@ -113,14 +119,15 @@ ENGINE_PREFIX = "autograd::engine::evaluate_function"
 ENGINE_START = "bwd/engine start"
 
 
-def build_profiler(out_dir: str, warmup_steps: int, active_steps: int) -> profile:
+def build_profiler(*, out_dir: str, warmup_steps: int, active_steps: int, tokens_per_step: int) -> profile:
     activities = [ProfilerActivity.CPU]
     if torch.cuda.is_available():
         activities.append(ProfilerActivity.CUDA)
     return profile(
         activities=activities,
         schedule=schedule(wait=warmup_steps, warmup=1, active=active_steps, repeat=1),
-        on_trace_ready=lambda prof: write_report(prof, out_dir, active_steps),
+        on_trace_ready=lambda prof: write_report(prof, out_dir=out_dir, active_steps=active_steps,
+                                                 tokens_per_step=tokens_per_step),
     )
 
 
@@ -258,12 +265,18 @@ def _clip(iv: list[Interval], windows: list[Interval]) -> list[Interval]:
 
 
 def _subtract(iv: list[Interval], covered: list[Interval]) -> list[Interval]:
-    out = []
+    """``iv`` minus ``covered``, both ``_merge``'s output (sorted, disjoint), in
+    one pass: a covered interval that ends before one of ``iv`` starts ends
+    before every later one starts too."""
+    out, first = [], 0
     for ts, te in iv:
+        while first < len(covered) and covered[first][1] <= ts:
+            first += 1
         cur = ts
-        for cs, ce in covered:
-            if ce <= cur or cs >= te:
-                continue
+        for k in range(first, len(covered)):
+            cs, ce = covered[k]
+            if cs >= te:
+                break
             if cs > cur:
                 out.append((cur, cs))
             cur = max(cur, ce)
@@ -271,6 +284,30 @@ def _subtract(iv: list[Interval], covered: list[Interval]) -> list[Interval]:
                 break
         if cur < te:
             out.append((cur, te))
+    return out
+
+
+def _boundaries(lanes: list[list[Interval]], window: Interval) -> list[float]:
+    """The window's ends and every end of the ``_merge``d ``lanes``' intervals
+    inside it, sorted: the slices between two consecutive ones are each inside
+    or outside every interval."""
+    ws, we = window
+    points = {ws, we}
+    for iv in lanes:
+        for s, e in iv[max(0, bisect.bisect_left(iv, (ws,)) - 1):bisect.bisect_left(iv, (we,))]:
+            points.update(p for p in (s, e) if ws < p < we)
+    return sorted(points)
+
+
+def _covered_slices(iv: list[Interval], points: list[float]) -> list[bool]:
+    """Per slice between consecutive ``points``, whether one of the ``_merge``d
+    ``iv`` covers it; a cursor that only moves forward, since a disjoint
+    interval ending at or before a slice's start covers no later slice."""
+    out, k = [], max(0, bisect.bisect_left(iv, (points[0],)) - 1)
+    for lo, hi in zip(points, points[1:], strict=False):
+        while k < len(iv) and iv[k][1] <= lo:
+            k += 1
+        out.append(k < len(iv) and iv[k][0] <= lo and hi <= iv[k][1])
     return out
 
 
@@ -384,17 +421,18 @@ def partition_steps(events: list, steps: list[Interval]) -> list[dict[str, float
             named[name].append((e["ts"], e["ts"] + e["dur"]))
     named = {name: _merge(iv) for name, iv in named.items()}
     per_step = []
-    for ws, we in steps:
+    for window in steps:
         totals = dict.fromkeys(PARTITION, 0.0)
-        points = sorted({ws, we} | {p for iv in [*lanes.values(), data, *named.values()]
-                                    for s, e in iv for p in (s, e) if ws < p < we})
-        for lo, hi in zip(points, points[1:], strict=False):
-            active = tuple(lane for lane, iv in lanes.items()
-                           if any(s <= lo and hi <= e for s, e in iv))
-            key = _part(active, any(s <= lo and hi <= e for s, e in data))
+        points = _boundaries([*lanes.values(), data, *named.values()], window)
+        in_lane = {lane: _covered_slices(iv, points) for lane, iv in lanes.items()}
+        in_data = _covered_slices(data, points)
+        in_named = {name: _covered_slices(iv, points) for name, iv in named.items()}
+        for k, (lo, hi) in enumerate(zip(points, points[1:], strict=False)):
+            active = tuple(lane for lane in lanes if in_lane[lane][k])
+            key = _part(active, in_data[k])
             if key == "host":
-                key = next((part for name, part in HOST_PARTS.items()
-                            if any(s <= lo and hi <= e for s, e in named[name])), "host/other")
+                key = next((part for name, part in HOST_PARTS.items() if in_named[name][k]),
+                           "host/other")
             totals[key] += hi - lo
         per_step.append(totals)
     return per_step
@@ -539,17 +577,61 @@ def _table(host: dict, device: dict, spread: tuple[dict, dict] | None) -> list[s
     return rows
 
 
-def write_report(prof: profile, out_dir: str, active_steps: int) -> None:
+def memory_now() -> dict[str, float]:
+    """The process's memory in GiB: the peak CUDA memory allocated and reserved
+    since it started, and the host's resident set now (its lifetime peak
+    would be the model's construction on the host, not the training step)."""
+    with open("/proc/self/statm") as f:
+        resident_pages = int(f.read().split()[1])
+    memory = {"host_resident_gib": resident_pages * resource.getpagesize() / 2**30}
+    if torch.cuda.is_available():
+        memory["peak_cuda_allocated_gib"] = torch.cuda.max_memory_allocated() / 2**30
+        memory["peak_cuda_reserved_gib"] = torch.cuda.max_memory_reserved() / 2**30
+    return memory
+
+
+def step_metrics(events: list, steps: list[Interval], tokens_per_step: int) -> list[dict[str, float]]:
+    """Per recorded step: its wall time, tokens per second over it, and the
+    share of it in which the GPU runs a kernel or memset."""
+    kernels = _merge([(e["ts"], e["ts"] + e["dur"]) for e in events
+                      if e.get("cat") in ("kernel", "gpu_memset")])
+    out = []
+    for ws, we in steps:
+        busy_us = sum(te - ts for ts, te in _clip(kernels, [(ws, we)]))
+        out.append({"step_ms": (we - ws) / 1e3, "tokens_per_s": tokens_per_step / ((we - ws) / 1e6),
+                    "gpu_utilization": busy_us / (we - ws)})
+    return out
+
+
+def write_metrics(*, out_dir: str, per_step: list[dict[str, float]], tokens_per_step: int,
+                  memory: dict[str, float]) -> dict:
+    """``metrics.json``: every step's metrics, their mean, median and std, and the memory."""
+    names = per_step[0].keys()
+    metrics = {
+        "tokens_per_step": tokens_per_step,
+        **{stat: {n: fn([s[n] for s in per_step]) for n in names}
+           for stat, fn in (("mean", statistics.fmean), ("median", statistics.median), ("std", _std))},
+        **memory,
+        "steps": per_step,
+    }
+    with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=1)
+    return metrics
+
+
+def write_report(prof: profile, *, out_dir: str, active_steps: int, tokens_per_step: int) -> None:
     os.makedirs(out_dir, exist_ok=True)
     prof.export_chrome_trace(os.path.join(out_dir, "profile_trace.json"))
-    peak_gib = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None
-    report_from_trace(out_dir, active_steps, peak_gib)
+    report_from_trace(out_dir=out_dir, active_steps=active_steps, tokens_per_step=tokens_per_step,
+                      memory=memory_now())
 
 
-def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -> None:
+def report_from_trace(*, out_dir: str, active_steps: int, tokens_per_step: int,
+                      memory: dict[str, float]) -> None:
     """Build ``profile.md`` (the mean over the recorded steps, then the median
-    with the std across steps) and ``steps.json`` (every step's rows and its
-    wall-time partition) from an exported ``profile_trace.json``."""
+    with the std across steps), ``steps.json`` (every step's rows and its
+    wall-time partition) and ``metrics.json`` from an exported
+    ``profile_trace.json`` and the run's ``memory`` (``memory_now``)."""
     events = json.load(open(os.path.join(out_dir, "profile_trace.json")))["traceEvents"]
     steps = step_windows(events)
     if len(steps) != active_steps:
@@ -564,8 +646,12 @@ def report_from_trace(out_dir: str, active_steps: int, peak_gib: float | None) -
     lines += _table(*mean, spread=None)
     lines += ["", f"Median per step over the {active_steps} steps, with the std across them.", ""]
     lines += _table(*median, spread=std)
-    if peak_gib is not None:
-        lines += ["", f"Peak CUDA memory allocated: {peak_gib:.2f} GiB"]
+    metrics = write_metrics(out_dir=out_dir, per_step=step_metrics(events, steps, tokens_per_step),
+                            tokens_per_step=tokens_per_step, memory=memory)
+    mid = metrics["median"]
+    lines += ["", f"Median over the steps: {mid['tokens_per_s']:,.0f} tokens/s "
+                  f"({tokens_per_step:,} tokens per step), GPU utilization {100 * mid['gpu_utilization']:.1f}%.",
+              "", "Memory: " + ", ".join(f"{k} {v:.2f}" for k, v in memory.items())]
     report = "\n".join(lines) + "\n"
     with open(os.path.join(out_dir, "profile.md"), "w") as f:
         f.write(report)
