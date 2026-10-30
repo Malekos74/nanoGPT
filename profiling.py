@@ -603,9 +603,17 @@ def step_metrics(events: list, steps: list[Interval], tokens_per_step: int) -> l
     return out
 
 
+def unix_windows(base_ns: int, steps: list[Interval]) -> list[Interval]:
+    """``steps`` in seconds since the epoch: a trace's ``ts`` are microseconds after its
+    ``baseTimeNanoseconds``. Lines the steps up with samples taken outside the profiler,
+    such as the profile job's GPU clocks."""
+    return [(base_ns / 1e9 + s / 1e6, base_ns / 1e9 + e / 1e6) for s, e in steps]
+
+
 def write_metrics(*, out_dir: str, per_step: list[dict[str, float]], tokens_per_step: int,
-                  memory: dict[str, float]) -> dict:
-    """``metrics.json``: every step's metrics, their mean, median and std, and the memory."""
+                  memory: dict[str, float], step_windows_unix_s: list[Interval]) -> dict:
+    """``metrics.json``: every step's metrics, their mean, median and std, the memory,
+    and the steps' wall-clock windows (``unix_windows``)."""
     names = per_step[0].keys()
     metrics = {
         "tokens_per_step": tokens_per_step,
@@ -613,6 +621,7 @@ def write_metrics(*, out_dir: str, per_step: list[dict[str, float]], tokens_per_
            for stat, fn in (("mean", statistics.fmean), ("median", statistics.median), ("std", _std))},
         **memory,
         "steps": per_step,
+        "step_windows_unix_s": step_windows_unix_s,
     }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=1)
@@ -632,7 +641,8 @@ def report_from_trace(*, out_dir: str, active_steps: int, tokens_per_step: int,
     with the std across steps), ``steps.json`` (every step's rows and its
     wall-time partition) and ``metrics.json`` from an exported
     ``profile_trace.json`` and the run's ``memory`` (``memory_now``)."""
-    events = json.load(open(os.path.join(out_dir, "profile_trace.json")))["traceEvents"]
+    trace = json.load(open(os.path.join(out_dir, "profile_trace.json")))
+    events = trace["traceEvents"]
     steps = step_windows(events)
     if len(steps) != active_steps:
         raise ValueError(f"expected {active_steps} recorded steps, the trace has {len(steps)}")
@@ -647,7 +657,8 @@ def report_from_trace(*, out_dir: str, active_steps: int, tokens_per_step: int,
     lines += ["", f"Median per step over the {active_steps} steps, with the std across them.", ""]
     lines += _table(*median, spread=std)
     metrics = write_metrics(out_dir=out_dir, per_step=step_metrics(events, steps, tokens_per_step),
-                            tokens_per_step=tokens_per_step, memory=memory)
+                            tokens_per_step=tokens_per_step, memory=memory,
+                            step_windows_unix_s=unix_windows(trace["baseTimeNanoseconds"], steps))
     mid = metrics["median"]
     lines += ["", f"Median over the steps: {mid['tokens_per_s']:,.0f} tokens/s "
                   f"({tokens_per_step:,} tokens per step), GPU utilization {100 * mid['gpu_utilization']:.1f}%.",
