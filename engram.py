@@ -96,6 +96,14 @@ class EngramMemoryConfig:
     # never normed or scaled on the host. One backward per step: a norm is one
     # backward's, so the table gradient cannot accumulate across backwards
     table_row_clip: bool = False
+    # with a reused table gradient, clip the table through the rows it holds, on
+    # the host after the step's last backward: the norm over the distinct rows
+    # written since the gradient was last cleared (every other row is zero)
+    # enters the global norm, and the clip coefficient is applied by the table
+    # optimizer's fused kernel ('optimizer', as table_row_clip does) or to those
+    # rows alone ('rows'); '' is off. The norm is the accumulated gradient's, so
+    # unlike table_row_clip it allows gradient accumulation
+    table_sparse_clip: str = ''
     # with pinned staging, copy the row gradients down on a side CUDA stream
     # that waits for them, instead of on the current stream, where the
     # backbone's remaining backward kernels would queue behind the copy; the
@@ -113,6 +121,12 @@ class EngramMemoryConfig:
             raise ValueError("table_download_stream needs table_pinned=True")
         if self.table_row_clip and not (self.table_pinned and self.table_dedup):
             raise ValueError("table_row_clip needs table_pinned=True and table_dedup=True")
+        if self.table_sparse_clip not in ('', 'optimizer', 'rows'):
+            raise ValueError(f"table_sparse_clip must be '', 'optimizer' or 'rows', got {self.table_sparse_clip!r}")
+        if self.table_sparse_clip and not self.table_grad_reuse:
+            raise ValueError("table_sparse_clip needs table_grad_reuse=True")
+        if self.table_sparse_clip and self.table_row_clip:
+            raise ValueError("table_sparse_clip and table_row_clip both clip the table; set one")
         if self.table_weight_pinned and self.table_device != 'cpu':
             raise ValueError("table_weight_pinned needs table_device='cpu'")
         expected = self.max_ngram_size - 1
@@ -186,6 +200,10 @@ class _PinnedStaging:
         # written into it since it was last cleared
         self.table_grad = torch.empty(0)
         self.touched = torch.empty(0, dtype=torch.long)
+        # table_sparse_clip: a mask over the table's rows that makes ``touched``
+        # distinct, and the distinct rows between the norm and the scale
+        self.touched_mask = torch.empty(0, dtype=torch.bool)
+        self.clip_rows: torch.Tensor | None = None
 
     def take(self, which: str, n_rows: int, capacity: int, dim: int) -> torch.Tensor:
         if n_rows > capacity:
@@ -270,6 +288,39 @@ class _PinnedStaging:
             self.touched = torch.cat([self.touched, ids])
         self.table_grad.index_add_(0, ids, rows)
         weight.grad = self.table_grad
+
+    def touched_norm(self) -> torch.Tensor:
+        """The norm of the persistent table gradient over the distinct rows written
+        since it was last cleared (every other row is zero), a 0-dim host tensor.
+        ``touched`` repeats a row that two backwards of an accumulation window
+        both wrote, so the rows go through a mask first. The rows are gathered in
+        chunks through the pinned gradient buffer, idle between the backward and
+        the next step's download and big enough for a step's lookups; the rows
+        are kept for ``scale_touched``."""
+        n_rows = self.table_grad.shape[0]
+        if self.touched_mask.shape != (n_rows,):
+            self.touched_mask = torch.zeros(n_rows, dtype=torch.bool)
+        self.touched_mask[self.touched] = True
+        self.clip_rows = self.touched_mask.nonzero().squeeze(1)
+        self.touched_mask.zero_()
+        norms = [torch.linalg.vector_norm(self._gather_grad(chunk))
+                 for chunk in self.clip_rows.split(self.grads.shape[0])]
+        return torch.linalg.vector_norm(torch.stack(norms))
+
+    def scale_touched(self, clip_coef: torch.Tensor) -> None:
+        """Scale the rows ``touched_norm`` took the norm over by ``clip_coef``, in
+        place in the persistent table gradient. In reverse chunk order: the norm's
+        last chunk is still in the pinned buffer and is not gathered again."""
+        if self.clip_rows is None:
+            raise RuntimeError("table_sparse_clip: no norm taken since the last scale")
+        chunks = self.clip_rows.split(self.grads.shape[0])
+        self.clip_rows = None
+        for i, chunk in enumerate(reversed(chunks)):
+            grads = self.grads[:chunk.numel()] if i == 0 else self._gather_grad(chunk)
+            self.table_grad.index_copy_(0, chunk, grads.mul_(clip_coef))
+
+    def _gather_grad(self, rows: torch.Tensor) -> torch.Tensor:
+        return torch.index_select(self.table_grad, 0, rows, out=self.grads[:rows.numel()])
 
 
 class _HostGather(torch.autograd.Function):
@@ -417,13 +468,12 @@ class EngramMemory(nn.Module):
         # gradient takes the reverse path through autograd
         return self.multi_head_embedding(ids.to(weight.device)).to(device)
 
-    def _fetch(self, ids: torch.Tensor, inverse: torch.Tensor | None,
-               batch_shape: torch.Size) -> torch.Tensor:
-        """The embeddings ``[B, T, H*dim]`` of the flat row ids; with ``inverse``
-        (deduplicated step) ``ids`` are the distinct rows and ``inverse`` places
+    @staticmethod
+    def _expand(rows: torch.Tensor, inverse: torch.Tensor | None,
+                batch_shape: torch.Size) -> torch.Tensor:
+        """The embeddings ``[B, T, H*dim]`` of fetched ``rows``; with ``inverse``
+        (deduplicated step) ``rows`` are the distinct rows and ``inverse`` places
         them per lookup, its backward summing the row gradients per distinct row."""
-        capacity = ids.numel() if inverse is None else inverse.numel()
-        rows = self._lookup(ids, capacity)
         if inverse is not None:
             rows = torch.index_select(rows, 0, inverse)
         return rows.view(*batch_shape, -1)
@@ -491,16 +541,28 @@ class EngramMemory(nn.Module):
         self._prefetched = (host_ids, inverse)
 
     def take_grad_norm(self) -> torch.Tensor:
-        """The norm of the table's gradient from the last backward (``table_row_clip``),
-        a 0-dim tensor on the model's device. Each backward's norm is taken once:
-        a clip without a backward since the last one raises."""
+        """The norm of the table's gradient for the clip. With ``table_row_clip``
+        the last backward's, a 0-dim tensor on the model's device, taken once per
+        backward: a clip without a backward since the last one raises. With
+        ``table_sparse_clip`` the accumulated gradient's, a 0-dim host tensor."""
+        if self.config.table_sparse_clip:
+            if self.multi_head_embedding.weight.grad is None:
+                raise RuntimeError(f"layer {self.layer_id}: no table gradient since the last zero_grad")
+            return self._staging.touched_norm()
         if not self.config.table_row_clip:
-            raise RuntimeError(f"layer {self.layer_id}: table_row_clip is off")
+            raise RuntimeError(f"layer {self.layer_id}: neither table_row_clip nor table_sparse_clip is on")
         norm = self._staging.grad_norm
         if norm is None:
             raise RuntimeError(f"layer {self.layer_id}: no table gradient norm since the last clip")
         self._staging.grad_norm = None
         return norm
+
+    def scale_table_grad(self, clip_coef: torch.Tensor) -> None:
+        """``table_sparse_clip='rows'``: scale the rows ``take_grad_norm`` took the
+        norm over by ``clip_coef``, a 0-dim host tensor."""
+        if self.config.table_sparse_clip != 'rows':
+            raise RuntimeError(f"layer {self.layer_id}: table_sparse_clip is not 'rows'")
+        self._staging.scale_touched(clip_coef)
 
     def _take_prefetched(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self._prefetched is None:
@@ -512,26 +574,34 @@ class EngramMemory(nn.Module):
         self._staging.ids_ready.synchronize()
         return ids, inverse
 
-    def fetch(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """The step's embeddings ``[B, T, H*dim]`` on the model's device for raw
-        ``input_ids`` [B, T]: addressing and the row fetch, the only part of the
-        forward that touches the table."""
+    def fetch(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The step's rows ``[n, dim]`` on the model's device for raw ``input_ids``
+        [B, T], and the inverse map that places them per lookup (``None`` without
+        ``table_dedup``, when the rows already are per lookup): addressing and the
+        row fetch, the only part of the forward that touches the table."""
         if self.config.table_prefetch:
             ids, inverse = self._take_prefetched()
         else:
             ids, inverse = self._address_step(input_ids)  # [B*T*H] flat row ids
+        capacity = ids.numel() if inverse is None else inverse.numel()
         with _forward_range("engram/fetch"):
-            return self._fetch(ids, inverse, input_ids.shape)
+            return self._lookup(ids, capacity), inverse
 
-    def mix(self, embeddings: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Gate, value and short conv of fetched ``embeddings`` against
-        ``hidden_states`` [B, T, n_embd]: everything after the fetch."""
+    def mix(self, rows: torch.Tensor, inverse: torch.Tensor | None,
+            hidden_states: torch.Tensor) -> torch.Tensor:
+        """Gate, value and short conv of fetched ``rows`` against ``hidden_states``
+        [B, T, n_embd]: everything after the fetch. The rows are expanded per
+        lookup here rather than in ``fetch``, so that a checkpoint around ``mix``
+        (engram_checkpoint='after_fetch') keeps a deduplicated step's distinct
+        rows for backward, not their per-lookup expansion, ~1.8x the size."""
         with _forward_range("engram/mix"):
+            embeddings = self._expand(rows, inverse, hidden_states.shape[:-1])
             return self._mix(embeddings, hidden_states)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor):
         """``hidden_states`` [B, T, n_embd], ``input_ids`` [B, T] raw ids."""
-        return self.mix(embeddings=self.fetch(input_ids), hidden_states=hidden_states)
+        rows, inverse = self.fetch(input_ids)
+        return self.mix(rows=rows, inverse=inverse, hidden_states=hidden_states)
 
 
 def build_engram_layers(

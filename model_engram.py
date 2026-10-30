@@ -95,8 +95,9 @@ class GPTEngramConfig(GPTConfig):
     activation_checkpointing: bool = False
     # what of an Engram module the checkpointing recomputes: 'full' all of it,
     # the row fetch included (offloaded rows are gathered and uploaded again);
-    # 'after_fetch' keeps the fetched embeddings and recomputes only the gate,
-    # value and short conv, so the fetch runs once per step
+    # 'after_fetch' keeps the fetched rows (with table_dedup, only the distinct
+    # ones) and recomputes their expansion, the gate, value and short conv, so
+    # the fetch runs once per step
     engram_checkpoint: str = "full"
     # the training loss through Liger's fused linear cross-entropy, which runs the
     # head and the loss over chunks of tokens and never holds the whole logits
@@ -243,21 +244,32 @@ class GPTWithEngram(GPT):
         the dense table gradient on the host, and are scaled by the table
         optimizer rather than here: its fused kernel divides the gradient by
         ``grad_scale`` as it reads it (the attribute GradScaler sets for the same
-        purpose), so the coefficient costs the host no pass over the table."""
-        row_clip = [m for m in (self.engram_layers or {}).values() if m.config.table_row_clip]
-        if not row_clip:
+        purpose), so the coefficient costs the host no pass over the table.
+        Layers with ``table_sparse_clip`` contribute the norm of the rows their
+        accumulated table gradient holds, taken on the host, and are scaled by
+        the table optimizer the same way ('optimizer') or here, those rows alone
+        ('rows')."""
+        sparse = [m for m in (self.engram_layers or {}).values()
+                  if m.config.table_row_clip or m.config.table_sparse_clip]
+        if not sparse:
             return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
-        if len(row_clip) != len(self.engram_layers):
-            raise ValueError("table_row_clip must be on for every Engram layer or none")
-        if table_optimizer is None:
-            raise ValueError("table_row_clip needs the tables' optimizer to apply the clip")
-        table_ids = {id(m.multi_head_embedding.weight) for m in row_clip}
+        if len(sparse) != len(self.engram_layers):
+            raise ValueError("table_row_clip or table_sparse_clip must be on for every Engram layer or none")
+        scale_rows = sparse[0].config.table_sparse_clip == 'rows'
+        if table_optimizer is None and not scale_rows:
+            raise ValueError("table_row_clip and table_sparse_clip='optimizer' need the tables' optimizer to apply the clip")
+        table_ids = {id(m.multi_head_embedding.weight) for m in sparse}
         others = [p for p in self.parameters() if id(p) not in table_ids]
         grads = [p.grad for p in others if p.grad is not None]
-        total_norm = torch.nn.utils.get_total_norm([*grads, *(m.take_grad_norm() for m in row_clip)])
+        total_norm = torch.nn.utils.get_total_norm([*grads, *(m.take_grad_norm() for m in sparse)])
         torch.nn.utils.clip_grads_with_norm_(others, max_norm, total_norm)
         clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)  # clip_grads_with_norm_'s own
-        table_device = row_clip[0].multi_head_embedding.weight.device
+        table_device = sparse[0].multi_head_embedding.weight.device
+        if scale_rows:
+            clip_coef = clip_coef.to(table_device)
+            for module in sparse:
+                module.scale_table_grad(clip_coef)
+            return total_norm
         table_optimizer.grad_scale = clip_coef.reciprocal().to(table_device)
         return total_norm
 
@@ -287,7 +299,8 @@ class GPTWithEngram(GPT):
             return memory(hidden_states=hidden_states, input_ids=input_ids)
         if self.config.engram_checkpoint == "full":
             return checkpoint(memory, use_reentrant=False, hidden_states=hidden_states, input_ids=input_ids)
-        return checkpoint(memory.mix, use_reentrant=False, embeddings=memory.fetch(input_ids),
+        rows, inverse = memory.fetch(input_ids)
+        return checkpoint(memory.mix, use_reentrant=False, rows=rows, inverse=inverse,
                           hidden_states=hidden_states)
 
     def _inject(self, x, *, layer_id: int, idx):

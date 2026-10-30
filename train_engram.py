@@ -113,6 +113,7 @@ engram_table_prefetch = False # pinned tables: hash, dedup and copy the step's r
 engram_table_optimizer = 'adamw' # 'adamw', or 'momentum': Nesterov momentum only, V4.1-Flash's one state buffer (without its Sinkhorn balancing)
 engram_table_download_stream = False # pinned tables: copy the row gradients down on a side CUDA stream, so the backbone's remaining backward kernels do not queue behind the copy
 engram_table_row_clip = False # pinned, deduplicated tables: clip the table through the norm of its row gradients, taken on the GPU before they come down, with the clip coefficient folded into the table optimizer's fused kernel; the dense table gradient is never normed or scaled on the host (needs grad_clip > 0 and no gradient accumulation)
+engram_table_sparse_clip = '' # reused table gradient: clip the table through the norm of the rows its accumulated gradient holds, taken on the host after the last backward, with the clip coefficient folded into the table optimizer's fused kernel ('optimizer') or applied to those rows ('rows'); '' is off (needs grad_clip > 0, allows gradient accumulation)
 # the pinned upstream implementation; relative to this file's directory
 engram_repo = str(Path(__file__).resolve().parent.parent / 'engram')
 engram_repo_sha = 'fb7f84a21f91223715394a33a1dc24bbfb7f788e'
@@ -289,6 +290,7 @@ def build_engram_config() -> EngramMemoryConfig | None:
         table_grad_reuse=engram_table_grad_reuse,
         table_prefetch=engram_table_prefetch,
         table_row_clip=engram_table_row_clip,
+        table_sparse_clip=engram_table_sparse_clip,
         table_download_stream=engram_table_download_stream,
     )
 
@@ -317,6 +319,8 @@ if engram_config is not None and engram_config.table_row_clip:
         raise ValueError(f"engram_table_row_clip needs gradient_accumulation_steps=1, got {gradient_accumulation_steps}")
     if grad_clip == 0.0:
         raise ValueError("engram_table_row_clip needs grad_clip > 0")
+if engram_config is not None and engram_config.table_sparse_clip and grad_clip == 0.0:
+    raise ValueError("engram_table_sparse_clip needs grad_clip > 0")
 engram_mapping = None
 if engram_config is not None:
     print(f"building Engram memory on layers {engram_config.layer_ids}")
