@@ -56,7 +56,11 @@ class EngramMemoryConfig:
     table_device: str = ''
     # with offloaded tables, stage the rows and their gradients in pinned host
     # buffers (allocated once, reused every step) so the copies run as DMA at
-    # bus speed instead of through the driver's pageable-memory bounce buffer
+    # bus speed instead of through the driver's pageable-memory bounce buffer.
+    # The lookup is two autograd nodes, a host half (gather, scatter) and a
+    # device half (upload, download): the download hands the host half a CPU
+    # gradient, so autograd runs the scatter on the thread that called
+    # backward() while its CUDA thread goes on with the backbone's backward
     table_pinned: bool = False
     # keep the offloaded table itself in pinned memory (its gradient and
     # optimizer state stay pageable); nothing in the current pipeline DMAs
@@ -83,13 +87,6 @@ class EngramMemoryConfig:
     # kernels; the rows go up on the same side stream and overlap whatever the
     # backbone is still computing. All within the step, so nothing is stale.
     table_prefetch: bool = False
-    # with a reused gradient, run the table's backward beside autograd's CUDA
-    # thread instead of on it: the lookup is split into a host half (gather,
-    # scatter) and a device half (upload, download), and the download's result
-    # is a CPU tensor, which makes autograd run the scatter on the thread that
-    # called backward() while its CUDA thread goes on with the backbone's
-    # remaining blocks. backward() returns once both are done
-    table_async_backward: bool = False
     # with pinned, deduplicated tables, clip the table through its rows: the
     # norm of the row gradients, which is the dense gradient's norm since every
     # other row is zero, is taken on the device before the rows come down and
@@ -99,6 +96,11 @@ class EngramMemoryConfig:
     # never normed or scaled on the host. One backward per step: a norm is one
     # backward's, so the table gradient cannot accumulate across backwards
     table_row_clip: bool = False
+    # with pinned staging, copy the row gradients down on a side CUDA stream
+    # that waits for them, instead of on the current stream, where the
+    # backbone's remaining backward kernels would queue behind the copy; the
+    # scatter still waits for the copy to land
+    table_download_stream: bool = False
 
     def __post_init__(self):
         if self.table_pinned and self.table_device != 'cpu':
@@ -107,8 +109,8 @@ class EngramMemoryConfig:
             raise ValueError("table_grad_reuse needs table_pinned=True")
         if self.table_prefetch and not self.table_pinned:
             raise ValueError("table_prefetch needs table_pinned=True")
-        if self.table_async_backward and not self.table_grad_reuse:
-            raise ValueError("table_async_backward needs table_grad_reuse=True")
+        if self.table_download_stream and not self.table_pinned:
+            raise ValueError("table_download_stream needs table_pinned=True")
         if self.table_row_clip and not (self.table_pinned and self.table_dedup):
             raise ValueError("table_row_clip needs table_pinned=True and table_dedup=True")
         if self.table_weight_pinned and self.table_device != 'cpu':
@@ -163,10 +165,14 @@ class _PinnedStaging:
     ``landed`` the end of the last download, which the scatter waits for.
     A prefetching layer (``table_prefetch``) also owns a side ``stream``: its
     addressing and the copy of its row ids to the host run there ahead of the
-    backbone (``ids_ready`` marks the copy's end), and so does the upload."""
+    backbone (``ids_ready`` marks the copy's end), and so does the upload.
+    With ``table_download_stream`` the row gradients come down on a
+    ``download_stream`` of their own."""
 
-    def __init__(self, stream: torch.cuda.Stream | None, row_clip: bool):
+    def __init__(self, stream: torch.cuda.Stream | None,
+                 download_stream: torch.cuda.Stream | None, row_clip: bool):
         self.stream = stream
+        self.download_stream = download_stream
         # table_row_clip: the norm of the last backward's row gradients, a 0-dim
         # device tensor, until the clip takes it
         self.row_clip = row_clip
@@ -215,12 +221,22 @@ class _PinnedStaging:
 
     def download(self, grad: torch.Tensor, capacity: int) -> torch.Tensor:
         """The row gradients ``grad`` copied from the device into the pinned
-        gradient buffer, on the current stream; ``landed`` marks the copy's end."""
+        gradient buffer; ``landed`` marks the copy's end. On the download stream
+        when there is one: it waits for ``grad`` and copies while the current
+        stream goes on, and ``grad``'s memory is held until the copy is done.
+        Nothing is allocated on it, so no device memory lands in its pool."""
         host_grad = self.take("grads", grad.shape[0], capacity, grad.shape[1])
         if self.row_clip:
             self.grad_norm = torch.linalg.vector_norm(grad)
-        host_grad.copy_(grad, non_blocking=True)
-        self.landed.record()
+        if self.download_stream is None:
+            host_grad.copy_(grad, non_blocking=True)
+            self.landed.record()
+            return host_grad
+        self.download_stream.wait_stream(torch.cuda.current_stream(grad.device))
+        with torch.cuda.stream(self.download_stream):
+            host_grad.copy_(grad, non_blocking=True)
+            self.landed.record()
+        grad.record_stream(self.download_stream)
         return host_grad
 
     def scatter(self, weight: torch.Tensor, ids: torch.Tensor, rows: torch.Tensor,
@@ -256,37 +272,17 @@ class _PinnedStaging:
         weight.grad = self.table_grad
 
 
-class _PinnedLookup(torch.autograd.Function):
-    """Gather rows of a host table into pinned memory and upload them; in
-    backward, download the row gradients into pinned memory and scatter them
-    into a dense table gradient on the host: a fresh one returned to autograd,
-    or with ``reuse`` the staging's persistent one, attached to the weight
-    directly (autograd then gets no gradient for the weight). All of the
-    backward runs on autograd's CUDA thread, which waits for the download."""
-
-    @staticmethod
-    def forward(ctx, weight: torch.Tensor, ids: torch.Tensor, device: torch.device,
-                staging: _PinnedStaging, capacity: int, reuse: bool) -> torch.Tensor:
-        out = staging.upload(staging.gather(weight, ids, capacity), device)
-        ctx.save_for_backward(ids, weight)
-        ctx.staging, ctx.capacity, ctx.reuse = staging, capacity, reuse
-        return out
-
-    @staticmethod
-    def backward(ctx, grad: torch.Tensor):
-        ids, weight = ctx.saved_tensors
-        host_grad = ctx.staging.download(grad, ctx.capacity)
-        table_grad = ctx.staging.scatter(weight, ids, host_grad, ctx.reuse)
-        return table_grad, None, None, None, None, None
-
-
 class _HostGather(torch.autograd.Function):
-    """The host half of a lookup with ``table_async_backward``: the gather in
-    forward, the scatter in backward. Its backward's input is the CPU tensor
-    that ``_Upload``'s backward returns, and autograd runs a node whose input
-    gradient is on the CPU on the thread that called backward(), so the scatter
-    runs there, beside the CUDA thread's remaining backbone nodes, after waiting
-    for the download to land. backward() returns once both threads are done."""
+    """The host half of a pinned lookup: the gather in forward, the scatter in
+    backward, into a fresh dense table gradient returned to autograd or, with
+    ``reuse``, the staging's persistent one, attached to the weight directly
+    (autograd then gets no gradient for the weight). Its backward's input is
+    the CPU tensor that ``_Upload``'s backward returns, and autograd runs a node
+    whose input gradient is on the CPU on the thread that called backward(), so
+    the scatter runs there, beside the CUDA thread's remaining backbone nodes,
+    after waiting for the download to land. backward() returns once both
+    threads are done. One Function for both halves would get the CUDA gradient
+    and run the scatter on the CUDA thread, idling the GPU for its duration."""
 
     @staticmethod
     def forward(ctx, weight: torch.Tensor, ids: torch.Tensor, staging: _PinnedStaging,
@@ -415,10 +411,8 @@ class EngramMemory(nn.Module):
             # a prefetched step hands the ids over in the pinned host buffer
             host_ids = ids if ids.device == weight.device else ids.to(weight.device)
             staging, reuse = self._staging, self.config.table_grad_reuse
-            if self.config.table_async_backward:
-                rows = _HostGather.apply(weight, host_ids, staging, capacity, reuse)
-                return _Upload.apply(rows, device, staging, capacity)
-            return _PinnedLookup.apply(weight, host_ids, device, staging, capacity, reuse)
+            rows = _HostGather.apply(weight, host_ids, staging, capacity, reuse)
+            return _Upload.apply(rows, device, staging, capacity)
         # with offloaded tables this is the host-to-device copy of the rows; the
         # gradient takes the reverse path through autograd
         return self.multi_head_embedding(ids.to(weight.device)).to(device)
@@ -443,7 +437,9 @@ class EngramMemory(nn.Module):
             self.multi_head_embedding.to(self.config.table_device)
         if self.config.table_pinned:
             stream = torch.cuda.Stream() if self.config.table_prefetch else None
-            self._staging = _PinnedStaging(stream=stream, row_clip=self.config.table_row_clip)
+            download_stream = torch.cuda.Stream() if self.config.table_download_stream else None
+            self._staging = _PinnedStaging(stream=stream, download_stream=download_stream,
+                                           row_clip=self.config.table_row_clip)
         if self.config.table_weight_pinned:
             weight = self.multi_head_embedding.weight
             weight.data = weight.data.pin_memory()

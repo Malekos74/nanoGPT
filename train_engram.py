@@ -40,6 +40,7 @@ import pickle
 from contextlib import nullcontext
 from torch.profiler import record_function
 from profiling import build_profiler
+from memory_profiling import AllocatorLog, dump_memory_history, record_memory_history
 from dataclasses import asdict
 from pathlib import Path
 
@@ -110,7 +111,7 @@ engram_table_dedup = False # look up (and, offloaded, copy) each distinct row of
 engram_table_grad_reuse = False # pinned tables: keep the dense table gradient alive across steps instead of allocating and freeing it every step
 engram_table_prefetch = False # pinned tables: hash, dedup and copy the step's row ids to the host on a side stream before the backbone starts, and upload the rows on it, so the gather and the copy overlap the blocks before the layer
 engram_table_optimizer = 'adamw' # 'adamw', or 'momentum': Nesterov momentum only, V4.1-Flash's one state buffer (without its Sinkhorn balancing)
-engram_table_async_backward = False # reused gradient: scatter the row gradients into it on the thread that called backward(), beside autograd's CUDA thread, which goes on with the backbone's backward meanwhile
+engram_table_download_stream = False # pinned tables: copy the row gradients down on a side CUDA stream, so the backbone's remaining backward kernels do not queue behind the copy
 engram_table_row_clip = False # pinned, deduplicated tables: clip the table through the norm of its row gradients, taken on the GPU before they come down, with the clip coefficient folded into the table optimizer's fused kernel; the dense table gradient is never normed or scaled on the host (needs grad_clip > 0 and no gradient accumulation)
 # the pinned upstream implementation; relative to this file's directory
 engram_repo = str(Path(__file__).resolve().parent.parent / 'engram')
@@ -139,10 +140,17 @@ compile_mode = 'default' # torch.compile mode for the regions: 'default', 'reduc
 profile = False
 profile_warmup = 20 # steps skipped before the profiler starts recording; host-side runs settle slowly
 profile_steps = 10 # steps recorded; the tables are written when they are done
+# the CUDA allocator's history (allocations, frees, segments, per stream, with Python stacks)
+# from the second step to the end -> out_dir/memory_snapshot.pickle, see memory_profiling.py.
+# Slows every step, so not with profile=True
+memory_snapshot = False
+memory_snapshot_max_entries = 1000000 # the newest allocator events kept
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+if memory_snapshot and profile:
+    raise ValueError("memory_snapshot slows every step with stack collection; run it without profile=True")
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -280,8 +288,8 @@ def build_engram_config() -> EngramMemoryConfig | None:
         table_dedup=engram_table_dedup,
         table_grad_reuse=engram_table_grad_reuse,
         table_prefetch=engram_table_prefetch,
-        table_async_backward=engram_table_async_backward,
         table_row_clip=engram_table_row_clip,
+        table_download_stream=engram_table_download_stream,
     )
 
 def build_hash_mapping_for_engram(engram_config: EngramMemoryConfig):
@@ -453,7 +461,11 @@ profiler = build_profiler(out_dir=out_dir, warmup_steps=profile_warmup, active_s
                           tokens_per_step=tokens_per_iter) if profile and master_process else nullcontext()
 profiler.__enter__()
 dedup_steps = [] # per step, {layer_id: {"lookups", "unique"}}: how much the step's row ids deduplicated
+allocator_log = AllocatorLog() if profile and master_process and device_type == 'cuda' else None
 while True:
+    if memory_snapshot and master_process and local_iter_num == 1:
+        # from the second step: the first one's compilation would fill the history
+        record_memory_history(max_entries=memory_snapshot_max_entries)
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -537,6 +549,8 @@ while True:
     step_span.__exit__(None, None, None)
     if profile and master_process:
         profiler.step()
+    if allocator_log is not None:
+        allocator_log.step()
     if engram_table_dedup and master_process:
         dedup_steps.append({layer_id: dict(zip(("lookups", "unique"), module.last_dedup))
                             for layer_id, module in raw_model.engram_layers.items()})
@@ -563,6 +577,10 @@ while True:
         break
 
 profiler.__exit__(None, None, None)
+if allocator_log is not None:
+    allocator_log.write(out_dir=out_dir, profile_warmup=profile_warmup, profile_steps=profile_steps)
+if memory_snapshot and master_process:
+    dump_memory_history(out_dir=out_dir)
 if profile and master_process and engram_table_dedup:
     with open(os.path.join(out_dir, 'dedup.json'), 'w') as f:
         json.dump({'profile_warmup': profile_warmup, 'profile_steps': profile_steps, 'steps': dedup_steps}, f, indent=1)

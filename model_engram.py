@@ -123,7 +123,7 @@ class GPTEngramConfig(GPTConfig):
         if self.activation_checkpointing and self.engram is not None and \
                 self.engram_checkpoint == "full" and self.engram.table_pinned:
             # the pinned paths (and everything built on them: gradient reuse,
-            # prefetch, async backward) assume one fetch per backward
+            # prefetch) assume one fetch per backward
             raise ValueError("engram_checkpoint='full' recomputes the fetch, which the pinned "
                              "table paths do once per step; use engram_checkpoint='after_fetch'")
         if self.engram is not None:

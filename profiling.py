@@ -83,9 +83,9 @@ PARENTS = {
              "backward", "optimizer"],
     "fwd/engram": ["engram/address", "engram/dedup", "engram/fetch", "engram/mix",
                    "engram/residual_add"],
-    # table_grad first: the table's backward is counted in full, whether it runs
-    # on the calling thread beside the copy (eager), inside bwd/engram (pinned)
-    # or on its own thread under the backbone's backward (async)
+    # table_grad first: the table's backward is counted in full; it runs on the
+    # calling thread, beside the copy (eager) or under the backbone's backward
+    # (pinned)
     "backward": ["bwd/table_grad", "bwd/engine start", "bwd/backbone", "bwd/engram"],
     "optimizer": ["optimizer/clip", "optimizer/backbone", "optimizer/tables",
                   "optimizer/zero_grad"],
